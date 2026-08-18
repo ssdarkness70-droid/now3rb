@@ -38,1065 +38,6 @@
     }
   });
   antiDebugCall();
-
-/* ============================================================
-   DRAG+ BOT LAB — embedded in m.js (installed right after
-   antiDebugCall(), inside the main IIFE).
-   Adapted from Ryuten V8 Endymion-Bot-Lab.user.js v8.0.1.
-   Adaptations for drag ex:
-     1. readNativeRyutenSelection() reads Player.typeID (active tab)
-     2. gear button opens drag ex Settings instead of ENDYMION_RYUTEN
-     3. gmRequest falls back to fetch for ALL methods (no @connect needed)
-     4. Branding: RYUTEN -> DRAG+
-   The Node controller (src/index.js) is unchanged.
-   ============================================================ */
-(() => {
-  'use strict';
-
-  const uw = typeof unsafeWindow === 'object' ? unsafeWindow : window;
-  const API = 'http://127.0.0.1:8767';
-  const CONTROL_KEY = 'endymion-beta-lab';
-  const VERSION = '8.0.1';
-  const MAX_BOTS = 400;
-  const REQUEST_TIMEOUT_MS = 5000;
-  const OFFLINE_AFTER_FAILURES = 3;
-  const OFFLINE_AFTER_MS = 10000;
-  const DETAIL_POLL_MS = 2500;
-  const TOKEN_BROKER_CONCURRENCY = 3;
-  const socketStates = [];
-  const tabId = sessionStorage.getItem('e3b-botlab-tab-id') || `${Date.now().toString(36)}-${crypto.getRandomValues(new Uint32Array(2)).join('-')}`;
-  sessionStorage.setItem('e3b-botlab-tab-id', tabId);
-  const captureQueue = [];
-  let captureSequence = 0;
-  let selectedSocket = localStorage.getItem('e3b-botlab-leader-socket') || 'auto';
-  let mirrorControls = localStorage.getItem('e3b-botlab-mirror') !== 'false';
-  let followEnabled = localStorage.getItem('e3b-botlab-follow') !== 'false';
-  let autoSpawnBots = localStorage.getItem('e3b-botlab-auto-spawn') === 'true';
-  let formation = localStorage.getItem('e3b-botlab-formation') || 'stack';
-  let movementMode = localStorage.getItem('e3b-botlab-movement') || 'follow';
-  let panelVisible = localStorage.getItem('e3b-botlab-panel') !== 'false';
-  let controllerStatus = null;
-  let controllerLiveness = 'waiting';
-  let lastSuccessfulPollAt = 0;
-  let consecutivePollFailures = 0;
-  let lastPollError = '';
-  let lastDetailedPollAt = 0;
-  let postBusy = false;
-  let postPending = false;
-  let statusBusy = false;
-  let wHeld = false;
-  const tokenWorkerBusy = Array(TOKEN_BROKER_CONCURRENCY).fill(false);
-  let autoSpawnBusy = false;
-  const turnstileWidgetIds = new Map();
-  let turnstileSdkPromise;
-  let controlMode = 'main';
-  let nativeSelection = null;
-  let lastNativeActiveTab = null;
-  let nativeWaitingForRespawnTab = null;
-  let nativeDeathCandidateTab = null;
-  const nativeAliveByTab = new Map();
-  const nativeMissingSince = new Map();
-  const NATIVE_DEATH_CONFIRM_MS = 250;
-  if (localStorage.getItem('e3b-botlab-ui-version') !== VERSION) {
-    const firstInstall = !localStorage.getItem('e3b-botlab-ui-version');
-    localStorage.setItem('e3b-botlab-ui-version', VERSION);
-    if (!localStorage.getItem('e3b-botlab-count')) localStorage.setItem('e3b-botlab-count', '1');
-    if (!localStorage.getItem('e3b-botlab-mirror')) localStorage.setItem('e3b-botlab-mirror', 'false');
-    if (!localStorage.getItem('e3b-botlab-panel')) localStorage.setItem('e3b-botlab-panel', 'true');
-    if (firstInstall) panelVisible = true;
-    mirrorControls = localStorage.getItem('e3b-botlab-mirror') !== 'false';
-  }
-
-  class Reader {
-    constructor(bytes) {
-      this.bytes = bytes;
-      this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      this.offset = 0;
-    }
-    get remaining() { return this.view.byteLength - this.offset; }
-    get done() { return this.remaining <= 0; }
-    need(size) { if (this.remaining < size) throw new RangeError('truncated'); }
-    u8() { this.need(1); return this.view.getUint8(this.offset++); }
-    u16() { this.need(2); const v = this.view.getUint16(this.offset, true); this.offset += 2; return v; }
-    u32() { this.need(4); const v = this.view.getUint32(this.offset, true); this.offset += 4; return v; }
-    i32() { this.need(4); const v = this.view.getInt32(this.offset, true); this.offset += 4; return v; }
-    f64() { this.need(8); const v = this.view.getFloat64(this.offset, true); this.offset += 8; return v; }
-    skipZeroString() {
-      while (this.offset < this.view.byteLength && this.view.getUint8(this.offset) !== 0) this.offset += 1;
-      if (this.offset < this.view.byteLength) this.offset += 1;
-    }
-  }
-
-  const createWorld = () => ({
-    cells: new Map(),
-    ownIds: new Set(),
-    bounds: null,
-    lastPacketAt: 0,
-    lastWorldAt: 0,
-    parseError: '',
-  });
-
-  const bytesFrom = (value) => {
-    if (value instanceof ArrayBuffer) return new Uint8Array(value);
-    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    return null;
-  };
-
-  const toArrayBuffer = async (value) => {
-    if (value instanceof ArrayBuffer) return value;
-    if (ArrayBuffer.isView(value)) return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-    if (value instanceof Blob) return value.arrayBuffer();
-    return null;
-  };
-
-  const toBase64 = (bytes) => {
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-  };
-
-  function parseWorldUpdate(reader, world) {
-    const now = Date.now();
-    const eatCount = reader.u16();
-    for (let i = 0; i < eatCount; i += 1) {
-      reader.u32();
-      const victim = reader.u32();
-      world.cells.delete(victim);
-      world.ownIds.delete(victim);
-    }
-
-    while (!reader.done) {
-      const id = reader.u32();
-      if (id === 0) break;
-      const cell = world.cells.get(id) || { id };
-      cell.x = reader.i32();
-      cell.y = reader.i32();
-      cell.radius = reader.u16();
-      const flags = reader.u8();
-      if (flags & 64) reader.i32();
-      if (flags & 2) { reader.u8(); reader.u8(); reader.u8(); }
-      if (flags & 4) reader.skipZeroString();
-      if (flags & 8) reader.skipZeroString();
-      if (flags & 128) reader.skipZeroString();
-      cell.updatedAt = now;
-      world.cells.set(id, cell);
-    }
-
-    if (reader.remaining >= 2) {
-      const removeCount = reader.u16();
-      for (let i = 0; i < removeCount && reader.remaining >= 4; i += 1) {
-        const id = reader.u32();
-        world.cells.delete(id);
-        world.ownIds.delete(id);
-      }
-    }
-    world.lastWorldAt = now;
-  }
-
-  function parseIncoming(state, input) {
-    const bytes = bytesFrom(input);
-    if (!bytes?.length) return;
-    const reader = new Reader(bytes);
-    const opcode = reader.u8();
-    const world = state.world;
-    world.lastPacketAt = Date.now();
-    try {
-      if (opcode === 16) {
-        parseWorldUpdate(reader, world);
-      } else if (opcode === 18) {
-        world.cells.clear();
-        world.ownIds.clear();
-      } else if (opcode === 20) {
-        world.ownIds.clear();
-      } else if (opcode === 32 && reader.remaining >= 4) {
-        world.ownIds.add(reader.u32());
-        state.lastOwnershipAt = Date.now();
-      } else if (opcode === 65 && reader.remaining >= 32) {
-        const left = reader.f64();
-        const top = reader.f64();
-        const right = reader.f64();
-        const bottom = reader.f64();
-        if ([left, top, right, bottom].every(Number.isFinite) && right > left && bottom > top) {
-          world.bounds = { left, top, right, bottom };
-        }
-      }
-    } catch (error) {
-      world.parseError = `${opcode}: ${error.message}`;
-    }
-  }
-
-  function inspectOutgoing(state, data) {
-    const bytes = bytesFrom(data);
-    if (!bytes?.length) return;
-    const opcode = bytes[0];
-    capturePacket(state, 'out', bytes);
-    if (opcode === 255) {
-      state.handshakeBase64 = toBase64(bytes);
-    } else if (opcode === 16 && bytes.byteLength >= 17) {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      state.target = { x: view.getFloat64(1, true), y: view.getFloat64(9, true) };
-      state.lastInputAt = Date.now();
-    }
-  }
-
-  function shouldRouteToBots(state, bytes) {
-    if (controlMode !== 'bots' || !bytes?.length) return false;
-    if (state !== selectedLeaderState()) return false;
-    return bytes[0] === 16 || bytes[0] === 17 || bytes[0] === 21;
-  }
-
-  function holdMainCell() {
-    const state = selectedLeaderState();
-    const center = state && ownedCenter(state);
-    if (!state?.open || !center || !state.nativeSend) return;
-    const packet = new ArrayBuffer(17);
-    const view = new DataView(packet);
-    view.setUint8(0, 16);
-    view.setFloat64(1, Math.fround(Math.trunc(center.x)), true);
-    view.setFloat64(9, Math.fround(Math.trunc(center.y)), true);
-    state.nativeSend.call(state.ws, packet);
-  }
-
-  function setControlMode(mode) {
-    const next = mode === 'bots' ? 'bots' : 'main';
-    if (next === controlMode) return;
-    controlMode = next;
-    if (controlMode === 'bots') {
-      holdMainCell();
-    }
-    else if (wHeld) { wHeld = false; command('eject-stop'); }
-    updatePanel();
-    sendLeaderUpdate();
-  }
-
-  function toggleControlMode() {
-    setControlMode(controlMode === 'main' ? 'bots' : 'main');
-  }
-
-  function capturePacket(state, direction, bytes) {
-    const opcode = bytes[0];
-    const now = Date.now();
-    const previous = state.lastCaptureAt?.[direction] || 0;
-    state.lastCaptureAt ||= { in: 0, out: 0 };
-    if (opcode === 16 && previous && now - previous < 100) return;
-    state.lastCaptureAt[direction] = now;
-    const sensitive = direction === 'out' && opcode === 123;
-    const limit = 4096;
-    const raw = sensitive ? bytes.subarray(0, Math.min(2, bytes.length)) : bytes.subarray(0, limit);
-    captureQueue.push({
-      socketIndex: state.index,
-      direction,
-      opcode,
-      size: bytes.length,
-      deltaMs: previous ? now - previous : null,
-      at: now,
-      rawBase64: toBase64(raw),
-      truncated: bytes.length > raw.length,
-      redacted: sensitive,
-    });
-    if (captureQueue.length > 2000) captureQueue.splice(0, captureQueue.length - 2000);
-  }
-
-  function ownedCenter(state) {
-    let total = 0;
-    let x = 0;
-    let y = 0;
-    let pieces = 0;
-    for (const id of state.world.ownIds) {
-      const cell = state.world.cells.get(id);
-      if (!cell || !Number.isFinite(cell.x) || !Number.isFinite(cell.y) || !Number.isFinite(cell.radius)) continue;
-      const weight = Math.max(1, cell.radius * cell.radius);
-      x += cell.x * weight;
-      y += cell.y * weight;
-      total += weight;
-      pieces += 1;
-    }
-    return total ? { x: x / total, y: y / total, pieces } : null;
-  }
-
-  function protocolsContainRyuten(protocols) {
-    if (typeof protocols === 'string') return protocols === 'ghmarab';
-    return Array.isArray(protocols) && protocols.includes('ghmarab');
-  }
-
-  function likelyGameSocket(url, protocols) {
-    const text = String(url || '');
-    return text.startsWith('wss://') && (protocolsContainRyuten(protocols) || /\/V5(?:[/?#]|$)/i.test(text));
-  }
-
-  function installWebSocketObserver() {
-    const NativeWebSocket = uw.WebSocket;
-    if (!NativeWebSocket || NativeWebSocket.__endymionBotLabWrapped) return;
-
-    const WrappedWebSocket = new Proxy(NativeWebSocket, {
-      construct(target, args, newTarget) {
-        const ws = Reflect.construct(target, args, newTarget === WrappedWebSocket ? target : newTarget);
-        const [url, protocols] = args;
-        if (!likelyGameSocket(url, protocols)) return ws;
-
-        const state = {
-          index: socketStates.length + 1,
-          nativeSlot: null,
-          ws,
-          url: String(url),
-          protocols,
-          open: false,
-          closed: false,
-          world: createWorld(),
-          target: null,
-          lastInputAt: 0,
-          handshakeBase64: '',
-          lastOwnershipAt: 0,
-          lastCaptureAt: { in: 0, out: 0 },
-          nativeSend: null,
-        };
-        const usedNativeSlots = new Set(socketStates.map((candidate) => candidate.nativeSlot).filter((slot) => slot === 1 || slot === 2));
-        state.nativeSlot = [1, 2].find((slot) => !usedNativeSlots.has(slot)) || null;
-        socketStates.push(state);
-        updateSocketSelect();
-
-        const nativeSend = ws.send;
-        state.nativeSend = nativeSend;
-        ws.send = function patchedSend(data) {
-          let bytes;
-          try {
-            bytes = bytesFrom(data);
-            inspectOutgoing(state, data);
-          } catch (error) { console.debug('[Bot Lab] outgoing parse', error); }
-          if (shouldRouteToBots(state, bytes)) return undefined;
-          return nativeSend.call(this, data);
-        };
-
-        ws.addEventListener('open', () => {
-          state.open = true;
-          state.closed = false;
-          updatePanel();
-        });
-        ws.addEventListener('close', () => {
-          state.open = false;
-          state.closed = true;
-          updatePanel();
-        });
-        ws.addEventListener('message', async (event) => {
-          try {
-            const buffer = await toArrayBuffer(event.data);
-            if (buffer) {
-              const bytes = new Uint8Array(buffer);
-              capturePacket(state, 'in', bytes);
-              parseIncoming(state, buffer);
-            }
-          } catch (error) {
-            state.world.parseError = error.message;
-          }
-        });
-        return ws;
-      },
-    });
-
-    Object.defineProperty(WrappedWebSocket, '__endymionBotLabWrapped', { value: true });
-    uw.WebSocket = WrappedWebSocket;
-  }
-
-  function nativeStateForTab(tab) {
-    const slot = Number(tab);
-    if (slot !== 1 && slot !== 2) return null;
-    const assigned = socketStates
-      .filter((state) => state.nativeSlot === slot && state.open)
-      .sort((a, b) => b.index - a.index);
-    if (assigned.length && ownedCenter(assigned[0])) return assigned[0];
-    const promoted = socketStates
-      .filter((state) => state.nativeSlot == null && state.open)
-      .sort((a, b) => b.index - a.index);
-    const ownedPromoted = promoted.find((state) => ownedCenter(state));
-    return ownedPromoted || assigned[0] || promoted[0] || null;
-  }
-
-  function readNativeRyutenSelection() {
-    // Drag+ adaptation: the active playable tab is Player.typeID (1 or 2).
-    let activeTab = 1;
-    try {
-      const t = typeof Player !== 'undefined' && Player && Player.typeID;
-      activeTab = Number(t) === 2 ? 2 : 1;
-    } catch { /* not defined yet */ }
-    return {
-      available: true,
-      activeTab,
-      tab1: '1',
-      tab2: '2',
-      standbyReady: false,
-    };
-  }
-
-  function syncNativeLeaderSelection() {
-    const snapshot = readNativeRyutenSelection();
-    if (!snapshot) {
-      nativeSelection = null;
-      return null;
-    }
-
-    const now = Date.now();
-    const activeTab = snapshot.activeTab;
-    const previousActiveTab = lastNativeActiveTab;
-    const aliveByTab = new Map();
-    for (const tab of [1, 2]) {
-      const state = nativeStateForTab(tab);
-      const alive = Boolean(state && state.open && ownedCenter(state));
-      aliveByTab.set(tab, alive);
-      const wasAlive = nativeAliveByTab.get(tab) === true;
-      if (!alive && wasAlive) {
-        nativeMissingSince.set(tab, nativeMissingSince.get(tab) || now);
-        if (tab === activeTab || tab === previousActiveTab) nativeDeathCandidateTab = tab;
-      } else if (alive) {
-        nativeMissingSince.delete(tab);
-        if (nativeDeathCandidateTab === tab) nativeDeathCandidateTab = null;
-      }
-      nativeAliveByTab.set(tab, alive);
-    }
-
-    if (previousActiveTab && previousActiveTab !== activeTab) {
-      const previousAlive = aliveByTab.get(previousActiveTab) === true;
-      const missingAt = nativeMissingSince.get(previousActiveTab) || 0;
-      if (!previousAlive && missingAt && now - missingAt >= NATIVE_DEATH_CONFIRM_MS) {
-        nativeWaitingForRespawnTab = previousActiveTab;
-      }
-    }
-    if (previousActiveTab === activeTab) {
-      const missingAt = nativeMissingSince.get(activeTab) || 0;
-      if (missingAt && now - missingAt >= NATIVE_DEATH_CONFIRM_MS) {
-        nativeWaitingForRespawnTab = activeTab;
-      }
-    }
-    if (nativeDeathCandidateTab) {
-      const missingAt = nativeMissingSince.get(nativeDeathCandidateTab) || 0;
-      if (missingAt && now - missingAt >= NATIVE_DEATH_CONFIRM_MS && nativeAliveByTab.get(nativeDeathCandidateTab) === false) {
-        nativeWaitingForRespawnTab = nativeDeathCandidateTab;
-      }
-    }
-    if (nativeWaitingForRespawnTab) {
-      const waitingState = nativeStateForTab(nativeWaitingForRespawnTab);
-      if (waitingState && waitingState.open && ownedCenter(waitingState)) nativeWaitingForRespawnTab = null;
-    }
-    lastNativeActiveTab = activeTab;
-    nativeSelection = {
-      ...snapshot,
-      waitingForRespawn: Boolean(nativeWaitingForRespawnTab),
-      waitingForRespawnTab: nativeWaitingForRespawnTab,
-    };
-    return nativeSelection;
-  }
-
-  function selectedLeaderState() {
-    const native = syncNativeLeaderSelection();
-    if (native?.waitingForRespawn) return null;
-    if (native?.available) {
-      const active = nativeStateForTab(native.activeTab);
-      if (selectedSocket === 'auto') return active || null;
-    }
-    const candidates = socketStates.filter((state) => state.open && ownedCenter(state));
-    if (!candidates.length) return socketStates.find((state) => state.open) || null;
-    if (selectedSocket !== 'auto') {
-      const selected = candidates.find((state) => String(state.index) === selectedSocket);
-      if (selected) return selected;
-    }
-    return candidates.slice().sort((a, b) => (b.lastOwnershipAt || 0) - (a.lastOwnershipAt || 0)
-      || a.index - b.index)[0];
-  }
-
-  async function flushCapture() {
-    if (!captureQueue.length) return;
-    const packets = captureQueue.splice(0, 100);
-    try {
-      await gmRequest('POST', '/api/capture', { origin: location.origin, tabId, sequence: ++captureSequence, packets });
-    } catch {
-      captureQueue.unshift(...packets);
-    }
-  }
-
-  function fetchRequest(method, path, payload, timeoutMs = REQUEST_TIMEOUT_MS) {
-    const abort = new AbortController();
-    const timeout = setTimeout(() => abort.abort(), timeoutMs);
-    return fetch(`${API}${path}`, {
-      method,
-      headers: {
-        'content-type': 'application/json',
-        'x-endymion-key': CONTROL_KEY,
-      },
-      body: payload === undefined ? undefined : JSON.stringify(payload),
-      cache: 'no-store',
-      signal: abort.signal,
-    }).then(async (response) => {
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok || body.ok === false) throw new Error(body.error || `HTTP ${response.status}`);
-      return body;
-    }).catch((error) => {
-      if (error?.name === 'AbortError') throw new Error('Controller timeout');
-      throw error;
-    }).finally(() => clearTimeout(timeout));
-  }
-
-  function gmRequest(method, path, payload, timeoutMs = REQUEST_TIMEOUT_MS) {
-    // Drag+ adaptation: always fall back to fetch on a privileged-request
-    // failure, so the panel works even without an @connect grant (the
-    // controller sets CORS + Private Network Access headers on its own).
-    const hasPrivilegedRequest = typeof GM_xmlhttpRequest === 'function';
-    if (!hasPrivilegedRequest) return fetchRequest(method, path, payload, timeoutMs);
-    const privileged = new Promise((resolve, reject) => {
-      let settled = false;
-      const fail = (error) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
-      };
-      try {
-        GM_xmlhttpRequest({
-          method,
-          url: `${API}${path}`,
-          headers: {
-            'content-type': 'application/json',
-            'x-endymion-key': CONTROL_KEY,
-          },
-          data: payload === undefined ? undefined : JSON.stringify(payload),
-          timeout: timeoutMs,
-          onload: (response) => {
-            try {
-              const body = JSON.parse(response.responseText || '{}');
-              if (response.status < 200 || response.status >= 300 || body.ok === false) {
-                fail(new Error(body.error || `HTTP ${response.status || 0}`));
-                return;
-              }
-              if (!settled) {
-                settled = true;
-                resolve(body);
-              }
-            } catch (error) { fail(error); }
-          },
-          onerror: () => fail(new Error('Controller offline')),
-          onabort: () => fail(new Error('Controller request aborted')),
-          ontimeout: () => fail(new Error('Controller timeout')),
-        });
-      } catch (error) { fail(error); }
-    });
-    return privileged.catch((error) => fetchRequest(method, path, payload, timeoutMs).catch((fallbackError) => {
-      const detail = `${error?.message || 'privileged request failed'}; fallback: ${fallbackError?.message || fallbackError}`;
-      throw new Error(detail);
-    }));
-  }
-
-  function ensureTurnstileSdk() {
-    if (uw.turnstile?.render) return Promise.resolve(uw.turnstile);
-    if (turnstileSdkPromise) return turnstileSdkPromise;
-    turnstileSdkPromise = new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (callback, value) => {
-        if (settled) return;
-        settled = true;
-        clearInterval(poll);
-        clearTimeout(timeout);
-        callback(value);
-      };
-      const poll = setInterval(() => {
-        if (uw.turnstile?.render) finish(resolve, uw.turnstile);
-      }, 50);
-      const timeout = setTimeout(() => finish(reject, new Error('Turnstile SDK load timed out')), 15000);
-
-      const existing = document.querySelector('script[data-e3b-turnstile-sdk],script[src*="challenges.cloudflare.com/turnstile"]');
-      if (existing) {
-        existing.addEventListener('error', () => finish(reject, new Error('Turnstile SDK failed to load')), { once: true });
-        return;
-      }
-
-      const script = document.createElement('script');
-      script.dataset.e3bTurnstileSdk = '1';
-      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-      script.async = true;
-      script.addEventListener('error', () => finish(reject, new Error('Turnstile SDK failed to load')), { once: true });
-      document.documentElement.appendChild(script);
-    });
-    return turnstileSdkPromise;
-  }
-
-  async function obtainTurnstileToken(siteKey, botId, workerId) {
-    await ensureTurnstileSdk();
-    return new Promise((resolve, reject) => {
-      const containerId = `e3b-botlab-turnstile-${workerId}`;
-      let container = document.querySelector(`#${containerId}`);
-      if (!container) {
-        container = document.createElement('div');
-        container.id = containerId;
-        container.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden;pointer-events:none';
-        document.body.appendChild(container);
-      }
-      const previousWidgetId = turnstileWidgetIds.get(workerId);
-      if (previousWidgetId !== undefined) {
-        try { uw.turnstile.remove(previousWidgetId); } catch { /* already expired */ }
-        turnstileWidgetIds.delete(workerId);
-      }
-      container.replaceChildren();
-      let settled = false;
-      const cleanup = () => {
-        const widgetId = turnstileWidgetIds.get(workerId);
-        if (widgetId !== undefined) {
-          try { uw.turnstile.remove(widgetId); } catch { /* already expired */ }
-          turnstileWidgetIds.delete(workerId);
-        }
-        container.remove();
-      };
-      const finish = (callback, value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        queueMicrotask(cleanup);
-        callback(value);
-      };
-      const timeout = setTimeout(() => finish(reject, new Error(`Turnstile timed out for bot ${botId}`)), 100000);
-      try {
-        const widgetId = uw.turnstile.render(container, {
-          sitekey: siteKey,
-          callback: (token) => token
-            ? finish(resolve, token)
-            : finish(reject, new Error(`Turnstile returned no token for bot ${botId}`)),
-          'expired-callback': () => finish(reject, new Error(`Turnstile token expired for bot ${botId}`)),
-          'error-callback': () => finish(reject, new Error(`Turnstile error for bot ${botId}`)),
-        });
-        turnstileWidgetIds.set(workerId, widgetId);
-      } catch (error) {
-        finish(reject, error);
-      }
-    });
-  }
-
-  async function serviceTokenQueue(workerId) {
-    if (tokenWorkerBusy[workerId] || !document.body || !document.hasFocus() || document.visibilityState !== 'visible') return;
-    tokenWorkerBusy[workerId] = true;
-    let request;
-    try {
-      const response = await gmRequest('POST', '/api/token/request', { tabId });
-      request = response.request;
-      if (!request) return;
-      const token = await obtainTurnstileToken(request.siteKey, request.botId, workerId);
-      await gmRequest('POST', '/api/token/result', { tabId, requestId: request.requestId, generation: request.generation, attemptId: request.attemptId, token });
-    } catch (error) {
-      if (request?.requestId) {
-        try {
-          await gmRequest('POST', '/api/token/result', { tabId, requestId: request.requestId, generation: request.generation, attemptId: request.attemptId, error: error.message });
-        } catch { /* controller may have restarted */ }
-      }
-      controllerStatus = { ...(controllerStatus || {}), tokenError: error.message };
-    } finally {
-      tokenWorkerBusy[workerId] = false;
-    }
-  }
-
-  async function sendLeaderUpdate() {
-    if (postBusy) {
-      postPending = true;
-      return;
-    }
-    const state = selectedLeaderState();
-    const native = nativeSelection;
-    if (!state && !native?.available) return;
-    const center = state ? ownedCenter(state) : null;
-    const socketIndex = state?.index || native?.activeTab || 1;
-    postBusy = true;
-    try {
-      await gmRequest('POST', '/api/leader', {
-        origin: location.origin,
-        version: VERSION,
-        userAgent: navigator.userAgent,
-        gameUrl: state?.url || '',
-        handshakeBase64: state?.handshakeBase64 || '',
-        socketIndex,
-        alive: Boolean(center) && !native?.waitingForRespawn,
-        center,
-        bounds: state?.world?.bounds || null,
-        tabId,
-        focused: document.hasFocus(),
-        visible: document.visibilityState === 'visible',
-        captureSequence,
-        controlMode,
-        controlTarget: state?.target || null,
-        controlTargetAt: state?.lastInputAt || 0,
-        leaderAuthority: native?.available ? 'drag-active-tab' : 'owned-cell',
-        nativeActiveTab: native?.activeTab || null,
-        nativeWaitingForRespawn: Boolean(native?.waitingForRespawn),
-        nativeWaitingForRespawnTab: native?.waitingForRespawnTab || null,
-        nativeTab1: native?.tab1 || '',
-        nativeTab2: native?.tab2 || '',
-        tag: String(document.querySelector('#tag')?.value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 32),
-      });
-    } catch (error) {
-      controllerStatus = { ok: false, error: error.message };
-    } finally {
-      postBusy = false;
-      if (postPending) {
-        postPending = false;
-        queueMicrotask(sendLeaderUpdate);
-      }
-    }
-  }
-
-  async function pollStatus() {
-    if (statusBusy) return;
-    statusBusy = true;
-    try {
-      const now = Date.now();
-      const botsViewOpen = Boolean(panel?.querySelector('[data-view-panel="bots"].active'));
-      const wantsDetails = autoSpawnBots || (botsViewOpen && now - lastDetailedPollAt >= DETAIL_POLL_MS);
-      const nextStatus = await gmRequest('GET', wantsDetails ? '/api/status' : '/api/summary');
-      const previousBots = controllerStatus?.bots;
-      controllerStatus = {
-        ...(controllerStatus?.ok !== false ? controllerStatus : {}),
-        ...nextStatus,
-        ...(nextStatus.bots ? {} : previousBots ? { bots: previousBots } : {}),
-      };
-      if (nextStatus.bots) lastDetailedPollAt = now;
-      lastSuccessfulPollAt = Date.now();
-      consecutivePollFailures = 0;
-      lastPollError = '';
-      controllerLiveness = 'online';
-    } catch (error) {
-      consecutivePollFailures += 1;
-      lastPollError = error.message;
-      const staleFor = lastSuccessfulPollAt ? Date.now() - lastSuccessfulPollAt : Infinity;
-      controllerLiveness = consecutivePollFailures >= OFFLINE_AFTER_FAILURES
-        || (lastSuccessfulPollAt > 0 && staleFor >= OFFLINE_AFTER_MS)
-        ? 'offline'
-        : 'degraded';
-    } finally {
-      statusBusy = false;
-      updatePanel();
-    }
-  }
-
-  async function command(command, extra = {}) {
-    try {
-      controllerStatus = await gmRequest('POST', '/api/command', { command, ...extra });
-      lastSuccessfulPollAt = Date.now();
-      consecutivePollFailures = 0;
-      lastPollError = '';
-      controllerLiveness = 'online';
-    } catch (error) {
-      lastPollError = error.message;
-    }
-    updatePanel();
-  }
-
-  async function serviceAutoSpawn() {
-    if (!autoSpawnBots || autoSpawnBusy || !controllerStatus || controllerStatus.ok === false) return;
-    const readyToSpawn = controllerStatus.bots?.some((bot) => bot.connected
-      && bot.verification?.state === 'ACCEPTED'
-      && !bot.alive
-      && (bot.spawn?.state === 'NOT_SENT' || bot.spawn?.state === 'DEAD'));
-    if (!readyToSpawn) return;
-    autoSpawnBusy = true;
-    try {
-      await command('spawn');
-    } finally {
-      autoSpawnBusy = false;
-    }
-  }
-
-  let panel;
-  let statusText;
-  let countInput;
-  let socketSelect;
-  let followButton;
-  let wButton;
-  let mirrorCheckbox;
-  let formationSelect;
-  let movementSelect;
-  let nameTemplateInput;
-  let namesInput;
-  let namePreview;
-  let botRows;
-  let namingLoaded = false;
-  let lastRenderedBots = null;
-
-  function createPanel() {
-    if (panel || !document.body) return;
-    const style = document.createElement('style');
-    style.textContent = `
-      #e3b-botlab{position:fixed;right:18px;top:18px;left:auto;z-index:2147483646;width:430px;height:560px;max-height:calc(100vh - 36px);background:#171717;color:#eee;border:1px solid #303038;border-radius:7px;box-shadow:0 16px 55px rgba(0,0,0,.72);font:11px/1.3 Arial,Helvetica,sans-serif;overflow:hidden;user-select:none}
-      #e3b-botlab *{box-sizing:border-box}#e3b-botlab.hidden{display:none}#e3b-botlab.bot-control{border-color:#da2c76;box-shadow:0 0 0 1px rgba(218,44,118,.45),0 16px 55px rgba(0,0,0,.72)}
-      #e3b-botlab header{height:37px;padding:0 9px;background:#202020;display:flex;align-items:center;border-bottom:1px solid #292929;cursor:move}#e3b-botlab .brand{font-weight:900;letter-spacing:.1em;font-size:13px}#e3b-botlab .brand b{color:#d92a72}#e3b-botlab .online{margin-left:auto;font-size:8px;color:#777}#e3b-botlab .online strong{color:#56dc9f}#e3b-botlab .ryu-settings-link,#e3b-botlab .x{width:24px;height:24px;margin-left:7px;padding:0;border:0;background:#292929;color:#888;border-radius:3px}#e3b-botlab .ryu-settings-link:hover{background:#3e6c82;color:#fff}#e3b-botlab .x:hover{background:#d92a72;color:#fff}
-      #e3b-botlab .tabbar{height:36px;background:#121212;display:flex;align-items:stretch;border-bottom:1px solid #2d2d2d;padding:0 7px}#e3b-botlab .tab{width:44px;border:0;background:transparent;color:#777;font-size:15px;padding:0;position:relative}#e3b-botlab .tab:hover,#e3b-botlab .tab.active{color:#fff;background:#242424}#e3b-botlab .tab.active:after{content:'';position:absolute;height:2px;left:6px;right:6px;bottom:0;background:#d92a72}#e3b-botlab .tab span{display:block;font-size:6px;letter-spacing:.1em;margin-top:1px}#e3b-botlab .mode-toggle{margin:5px 0 5px auto;padding:0 9px;border-color:#444;background:#252525;color:#ddd;font-size:8px;letter-spacing:.08em}#e3b-botlab.bot-control .mode-toggle{border-color:#ffc742;color:#ffc742}
-      #e3b-botlab .pages{height:calc(100% - 73px);background:#181818;padding:10px}#e3b-botlab .page{display:none;height:100%;overflow:auto}#e3b-botlab .page.active{display:block}#e3b-botlab .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-bottom:7px}#e3b-botlab .stat{background:#222;border:1px solid #303030;padding:6px}#e3b-botlab .stat b{display:block;font-size:13px}#e3b-botlab .stat span{font-size:6px;color:#777;letter-spacing:.08em}
-      #e3b-botlab .status{height:84px;overflow:hidden;white-space:pre-line;background:#101010;border-left:2px solid #d92a72;padding:6px 8px;color:#aaa;font-size:9px;margin-bottom:7px}#e3b-botlab.bot-control .status{border-left-color:#ffc742}#e3b-botlab .row{display:flex;gap:5px;margin-bottom:5px;align-items:center}#e3b-botlab .field{min-width:0;flex:1}#e3b-botlab label.cap{display:block;color:#777;font-size:7px;letter-spacing:.08em;margin-bottom:2px;text-transform:uppercase}
-      #e3b-botlab button,#e3b-botlab input,#e3b-botlab select,#e3b-botlab textarea{font:inherit;color:#eee;border:1px solid #363636;background:#222;border-radius:3px;outline:0}#e3b-botlab input,#e3b-botlab select{height:29px;width:100%;padding:5px}#e3b-botlab textarea{width:100%;height:190px;padding:7px;resize:none;user-select:text;font-family:Consolas,monospace}#e3b-botlab input:focus,#e3b-botlab select:focus,#e3b-botlab textarea:focus{border-color:#d92a72}#e3b-botlab button{cursor:pointer;font-weight:700}#e3b-botlab .action{flex:1;height:29px;padding:0 4px;background:#303030;font-size:9px}#e3b-botlab .action:hover{filter:brightness(1.2)}#e3b-botlab .primary{background:#d92a50;border-color:#f03b61}#e3b-botlab .danger{background:#551c2b;border-color:#883247}#e3b-botlab .wide{flex:2}#e3b-botlab .hint{font-size:8px;color:#666;margin-top:5px}#e3b-botlab .check{display:flex;align-items:center;gap:4px;color:#777;font-size:8px;white-space:nowrap}#e3b-botlab .check input{width:auto;height:auto;accent-color:#d92a72}
-      #e3b-botlab .title{font-weight:800;font-size:10px;letter-spacing:.1em;padding-bottom:7px;margin-bottom:8px;border-bottom:1px solid #303030}#e3b-botlab .title small{float:right;color:#666;font-size:7px;font-weight:400}#e3b-botlab .preview{display:grid;grid-template-columns:repeat(2,1fr);gap:4px;margin:6px 0}#e3b-botlab .chip{padding:4px 5px;background:#222;border:1px solid #303030;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}
-      #e3b-botlab .table-wrap{height:295px;overflow:auto;border:1px solid #303030}#e3b-botlab .bot-table{width:100%;border-collapse:collapse;font-size:8px;user-select:text}#e3b-botlab .bot-table th{position:sticky;top:0;background:#222;color:#777;text-align:left;padding:5px;border-bottom:1px solid #383838}#e3b-botlab .bot-table td{padding:5px;border-bottom:1px solid #2d2d2d;vertical-align:top}#e3b-botlab .bot-table td small{display:block;color:#666}#e3b-botlab .empty{text-align:center!important;padding:40px 4px!important;color:#777}#e3b-botlab .footer{position:absolute;bottom:3px;right:7px;color:#444;font-size:6px}
-      @media(max-height:470px){#e3b-botlab{top:5px;height:calc(100vh - 10px)}}
-      @media(max-width:460px){#e3b-botlab{left:8px;right:8px;top:8px;width:auto;max-height:calc(100vh - 16px)}}
-    `;
-    document.documentElement.appendChild(style);
-    panel = document.createElement('section');
-    panel.id = 'e3b-botlab';
-    panel.classList.toggle('hidden', !panelVisible);
-    panel.innerHTML = `
-       <header><div class="brand"><b>D</b>RAG+</div><div class="online">BOT LAB · <strong id="e3b-head-online">WAITING</strong></div><button class="ryu-settings-link" id="e3b-ryuten-settings" title="Open drag settings">⚙</button><button class="x" id="e3b-close" title="Hide menu (F8)">×</button></header>
-       <div class="tabbar"><button class="tab active" data-view="control" title="Control">⌁<span>CONTROL</span></button><button class="tab" data-view="names" title="Names">✎<span>NAMES</span></button><button class="tab" data-view="bots" title="Bot status">☷<span>BOTS</span></button><button class="mode-toggle" id="e3b-mode" title="Choose whether mouse, Space, and W control drag or the bot group">CONTROL: MAIN</button></div>
-      <div class="pages">
-        <section class="page active" data-view-panel="control"><div class="stats"><div class="stat"><b id="e3b-connected">0</b><span>OPEN</span></div><div class="stat"><b id="e3b-ready">0</b><span>READY</span></div><div class="stat"><b id="e3b-alive">0</b><span>ALIVE</span></div><div class="stat"><b id="e3b-created">0</b><span>CREATED</span></div><div class="stat"><b id="e3b-capacity">0</b><span>USABLE</span></div></div><div class="status" id="e3b-status">Waiting for local controller...</div>
-          <div class="row"><div class="field"><label class="cap">Bots</label><input id="e3b-count" type="number" min="1" max="400" value="1"></div><div class="field wide"><label class="cap">Leader</label><select id="e3b-socket"><option value="auto">Leader: Auto</option></select></div></div>
-          <div class="row"><div class="field"><label class="cap">Formation</label><select id="e3b-formation"><option value="stack">Stack on leader</option><option value="ring">Ring</option><option value="trail">Trail</option><option value="spread">Spread</option><option value="circle">Circle</option><option value="custom">Custom</option></select></div><div class="field"><label class="cap">Movement</label><select id="e3b-movement"><option value="follow">Follow leader</option><option value="hold">Hold position</option><option value="dance">Dance L/R</option></select></div></div><div class="row"><button class="action" id="e3b-follow">FOLLOW: ON</button></div>
-          <div class="row"><button class="action primary" id="e3b-start">START</button><button class="action danger" id="e3b-stop">STOP</button><button class="action" id="e3b-reconnect">RECONNECT</button></div><div class="row"><button class="action" id="e3b-spawn">SPAWN</button><button class="action" id="e3b-respawn">RESPAWN</button><button class="action" id="e3b-split">SPLIT</button></div><div class="row"><button class="action" id="e3b-w">HOLD W</button><button class="action" id="e3b-freeze">FREEZE</button><button class="action danger" id="e3b-emergency">EMERGENCY</button></div><div class="row"><button class="action" id="e3b-auto-spawn">AUTO SPAWN: OFF</button></div><div class="row"><button class="action" id="e3b-capp-discover">CAPP DISCOVER</button><button class="action" id="e3b-capp-validate">VALIDATE</button><button class="action" id="e3b-capp-sync">SYNC ROUTES</button></div>
-           <label class="check"><input id="e3b-mirror" type="checkbox"> Mirror Space + W while MAIN controls your cell</label><div class="hint">F8 hides/shows this menu. Tab remains drag's cell switch. Switching CONTROL: MAIN/BOTS never stops or reconnects bots.</div></section>
-        <section class="page" data-view-panel="names"><div class="title">BOT NAMES <small>NO SKIN SETTINGS</small></div><div class="field"><label class="cap">Default name template</label><input id="e3b-name-template" maxlength="64" value="E3B-{id:02}"></div><div id="e3b-name-preview" class="preview"></div><div class="field"><label class="cap">One individual name per line</label><textarea id="e3b-names" spellcheck="false" placeholder="Bot One&#10;Bot Two&#10;Bot Three"></textarea></div><div class="row"><button class="action primary" id="e3b-save-names">SAVE NAMES</button><button class="action" id="e3b-clear-names">CLEAR</button></div><div class="hint" id="e3b-name-message">Saving names does not start bots.</div></section>
-        <section class="page" data-view-panel="bots"><div class="title">BOT STATUS <small id="e3b-bot-summary">0 bots</small></div><div class="table-wrap"><table class="bot-table"><thead><tr><th>BOT</th><th>STATE</th><th>VERIFY</th><th>MOVE</th><th>ROUTE / ERROR</th></tr></thead><tbody id="e3b-bot-rows"><tr><td colspan="5" class="empty">No bots created. The lab is idle.</td></tr></tbody></table></div></section>
-       </div><div class="footer">DRAG+ BOT LAB v${VERSION}</div>`;
-    document.body.appendChild(panel);
-
-    statusText = panel.querySelector('#e3b-status'); countInput = panel.querySelector('#e3b-count'); socketSelect = panel.querySelector('#e3b-socket'); followButton = panel.querySelector('#e3b-follow'); wButton = panel.querySelector('#e3b-w'); mirrorCheckbox = panel.querySelector('#e3b-mirror'); formationSelect = panel.querySelector('#e3b-formation'); movementSelect = panel.querySelector('#e3b-movement'); nameTemplateInput = panel.querySelector('#e3b-name-template'); namesInput = panel.querySelector('#e3b-names'); namePreview = panel.querySelector('#e3b-name-preview'); botRows = panel.querySelector('#e3b-bot-rows');
-    movementMode = ['follow', 'hold', 'dance'].includes(movementMode) ? movementMode : (followEnabled ? 'follow' : 'hold');
-    countInput.value = localStorage.getItem('e3b-botlab-count') || '1'; mirrorCheckbox.checked = mirrorControls; formationSelect.value = formation; movementSelect.value = movementMode; followButton.textContent = `FOLLOW: ${followEnabled ? 'ON' : 'OFF'}`;
-    panel.querySelectorAll('.tab').forEach((button) => button.addEventListener('click', () => { panel.querySelectorAll('.tab').forEach((item) => item.classList.toggle('active', item === button)); panel.querySelectorAll('.page').forEach((page) => page.classList.toggle('active', page.dataset.viewPanel === button.dataset.view)); if (button.dataset.view === 'bots') { lastDetailedPollAt = 0; pollStatus(); } }));
-    panel.querySelector('#e3b-close').addEventListener('click', () => { panelVisible = false; localStorage.setItem('e3b-botlab-panel', 'false'); panel.classList.add('hidden'); });
-    panel.querySelector('#e3b-ryuten-settings').addEventListener('click', () => {
-      panelVisible = false;
-      localStorage.setItem('e3b-botlab-panel', 'false');
-      panel.classList.add('hidden');
-      // Drag+ adaptation: open the drag ex Settings menu.
-      try { Settings.toggle(); } catch (e) { /* settings not ready */ }
-    });
-    panel.querySelector('#e3b-mode').addEventListener('click', toggleControlMode);
-     panel.querySelector('#e3b-auto-spawn').addEventListener('click', () => {
-       autoSpawnBots = !autoSpawnBots;
-       localStorage.setItem('e3b-botlab-auto-spawn', String(autoSpawnBots));
-       updatePanel();
-       serviceAutoSpawn();
-     });
-    panel.querySelector('#e3b-capp-discover').addEventListener('click', () => command('capp-discover'));
-    panel.querySelector('#e3b-capp-validate').addEventListener('click', () => command('capp-validate'));
-    panel.querySelector('#e3b-capp-sync').addEventListener('click', () => command('capp-sync'));
-    panel.querySelector('#e3b-start').addEventListener('click', async () => { const botCount = Math.max(1, Math.min(MAX_BOTS, Number(countInput.value) || 1)); countInput.value = String(botCount); localStorage.setItem('e3b-botlab-count', String(botCount)); await command('formation', { formation }); await command('movement', { mode: movementMode }); await command('follow', { enabled: followEnabled }); await command('start', { botCount }); });
-    panel.querySelector('#e3b-stop').addEventListener('click', () => command('stop')); panel.querySelector('#e3b-reconnect').addEventListener('click', () => command('reconnect')); panel.querySelector('#e3b-spawn').addEventListener('click', () => command('spawn')); panel.querySelector('#e3b-respawn').addEventListener('click', () => command('respawn')); panel.querySelector('#e3b-freeze').addEventListener('click', () => command('freeze', { enabled: !controllerStatus?.frozen })); panel.querySelector('#e3b-emergency').addEventListener('click', () => command('emergency-stop')); panel.querySelector('#e3b-split').addEventListener('click', () => command('split'));
-    wButton.addEventListener('pointerdown', () => { wHeld = true; wButton.textContent = 'RELEASE W'; command('eject-start'); }); const releaseW = () => { if (!wHeld) return; wHeld = false; wButton.textContent = 'HOLD W'; command('eject-stop'); }; wButton.addEventListener('pointerup', releaseW); wButton.addEventListener('pointerleave', releaseW); wButton.addEventListener('pointercancel', releaseW);
-    followButton.addEventListener('click', () => { followEnabled = !followEnabled; movementMode = followEnabled ? 'follow' : 'hold'; movementSelect.value = movementMode; localStorage.setItem('e3b-botlab-follow', String(followEnabled)); localStorage.setItem('e3b-botlab-movement', movementMode); followButton.textContent = `FOLLOW: ${followEnabled ? 'ON' : 'OFF'}`; command('movement', { mode: movementMode }); }); movementSelect.addEventListener('change', () => { movementMode = movementSelect.value; followEnabled = movementMode !== 'hold'; localStorage.setItem('e3b-botlab-movement', movementMode); localStorage.setItem('e3b-botlab-follow', String(followEnabled)); followButton.textContent = `FOLLOW: ${followEnabled ? 'ON' : 'OFF'}`; command('movement', { mode: movementMode }); }); formationSelect.addEventListener('change', () => { formation = formationSelect.value; localStorage.setItem('e3b-botlab-formation', formation); command('formation', { formation }); }); socketSelect.addEventListener('change', () => { selectedSocket = socketSelect.value; localStorage.setItem('e3b-botlab-leader-socket', selectedSocket); }); mirrorCheckbox.addEventListener('change', () => { mirrorControls = mirrorCheckbox.checked; localStorage.setItem('e3b-botlab-mirror', String(mirrorControls)); });
-    const updateNamePreview = () => { const template = nameTemplateInput.value || 'E3B-{id:02}'; const names = namesInput.value.replace(/\r/g, '').split('\n'); namePreview.replaceChildren(); for (let id = 1; id <= 4; id += 1) { const generated = template.replaceAll('{id:03}', String(id).padStart(3, '0')).replaceAll('{id:02}', String(id).padStart(2, '0')).replaceAll('{id}', String(id)); const chip = document.createElement('div'); chip.className = 'chip'; chip.textContent = `#${id} ${String(names[id - 1] || generated).slice(0, 32)}`; namePreview.appendChild(chip); } };
-    nameTemplateInput.addEventListener('input', updateNamePreview); namesInput.addEventListener('input', updateNamePreview); panel.querySelector('#e3b-save-names').addEventListener('click', async () => { await command('naming', { template: nameTemplateInput.value, names: namesInput.value.replace(/\r/g, '').split('\n').slice(0, MAX_BOTS) }); panel.querySelector('#e3b-name-message').textContent = controllerStatus?.ok === false ? controllerStatus.error : 'Names saved. No bots were started.'; }); panel.querySelector('#e3b-clear-names').addEventListener('click', async () => { namesInput.value = ''; updateNamePreview(); await command('naming', { template: nameTemplateInput.value, names: [] }); panel.querySelector('#e3b-name-message').textContent = 'Names cleared. No bots were started.'; });
-    panel.addEventListener('keydown', (event) => { if (isTypingTarget(event.target)) event.stopPropagation(); }); panel.addEventListener('keyup', (event) => { if (isTypingTarget(event.target)) event.stopPropagation(); }); makeDraggable(panel, panel.querySelector('header')); updateSocketSelect(); updateNamePreview(); updatePanel();
-  }
-
-  function makeDraggable(element, handle) {
-    let drag = null;
-    handle.addEventListener('pointerdown', (event) => {
-      drag = { x: event.clientX - element.offsetLeft, y: event.clientY - element.offsetTop };
-      handle.setPointerCapture(event.pointerId);
-      element.style.right = 'auto';
-      element.style.bottom = 'auto';
-    });
-    handle.addEventListener('pointermove', (event) => {
-      if (!drag) return;
-      element.style.left = `${Math.max(0, event.clientX - drag.x)}px`;
-      element.style.top = `${Math.max(0, event.clientY - drag.y)}px`;
-    });
-    handle.addEventListener('pointerup', () => { drag = null; });
-  }
-
-  function updateSocketSelect() {
-    if (!socketSelect) return;
-    const current = selectedSocket;
-    socketSelect.innerHTML = '<option value="auto">Leader: Auto</option>';
-    for (const state of socketStates) {
-      const option = document.createElement('option');
-      option.value = String(state.index);
-      option.textContent = `Leader: Socket ${state.index}`;
-      socketSelect.appendChild(option);
-    }
-    socketSelect.value = Array.from(socketSelect.options).some((option) => option.value === current) ? current : 'auto';
-  }
-
-  function updatePanel() {
-    if (!statusText || !panel) return;
-    const leader = selectedLeaderState();
-    const center = leader && ownedCenter(leader);
-    panel.classList.toggle('bot-control', controlMode === 'bots');
-    const hasHealthyStatus = controllerStatus && controllerStatus.ok !== false;
-    const offline = controllerLiveness === 'offline';
-    const degraded = hasHealthyStatus && controllerLiveness === 'degraded';
-    const online = hasHealthyStatus && !offline;
-    const versionMismatch = online && controllerStatus.version && controllerStatus.version !== VERSION;
-    const headOnline = panel.querySelector('#e3b-head-online');
-    const modeButton = panel.querySelector('#e3b-mode');
-    modeButton.textContent = `CONTROL: ${controlMode.toUpperCase()}`;
-    panel.querySelector('#e3b-auto-spawn').textContent = `AUTO SPAWN: ${autoSpawnBots ? 'ON' : 'OFF'}`;
-    headOnline.textContent = versionMismatch
-      ? 'RESTART REQUIRED'
-      : degraded
-        ? 'DEGRADED'
-        : online
-          ? 'ONLINE'
-          : controllerLiveness === 'waiting'
-            ? 'WAITING'
-            : 'OFFLINE';
-    headOnline.style.color = degraded ? '#ffc840' : online && !versionMismatch ? '#4fda9b' : '#ef5064';
-    if (!online) {
-      statusText.textContent = `Controller: ${lastPollError || 'offline'}\nGame socket: ${leader ? `captured #${leader.index}` : 'waiting'}\nNo successful poll for ${lastSuccessfulPollAt ? Math.round((Date.now() - lastSuccessfulPollAt) / 1000) : '10+'}s (${consecutivePollFailures} failures).`;
-      return;
-    }
-
-    for (const id of ['e3b-start', 'e3b-reconnect', 'e3b-spawn', 'e3b-respawn']) {
-      const button = panel.querySelector(`#${id}`);
-      if (button) button.disabled = Boolean(versionMismatch);
-    }
-    for (const id of ['e3b-capp-discover', 'e3b-capp-validate', 'e3b-capp-sync']) {
-      const button = panel.querySelector(`#${id}`);
-      if (button) button.disabled = Boolean(versionMismatch);
-    }
-    if (versionMismatch) {
-      statusText.textContent = `Controller ${controllerStatus.version} is older than client ${VERSION}.\nRestart Node before using START.`;
-    }
-
-    const failing = controllerStatus.bots?.find((bot) => bot.lastError);
-    const queued = controllerStatus.readiness?.queuedVerifications || 0;
-    const activeVerify = controllerStatus.readiness?.activeVerifications || 0;
-    const pool = controllerStatus.proxyPool || {};
-    const capp = controllerStatus.capp || {};
-    const sourceRouteLine = pool.sourceFileCount ? ` | file ${pool.sourceFileCount}` : '';
-    const routeLine = `Routes: ${pool.loaded ?? 0}/${pool.configuredLimit ?? MAX_BOTS} loaded${sourceRouteLine} | usable ${controllerStatus.readiness?.observedUsableRouteCapacity ?? 0} | fresh ${pool.freshRoutes ?? controllerStatus.readiness?.freshRoutes ?? 0} | available ${pool.availableRoutes ?? controllerStatus.readiness?.availableRoutes ?? 0}`;
-    const captcha = capp.captcha || {};
-    const discovery = capp.discovery || {};
-    const rotation = controllerStatus.rotation || capp.rotation || {};
-    const cappLine = `CAPP: ${capp.enabled ? 'ON' : 'OFF'} | discovery ${discovery.enabled ? 'ON' : 'OFF'} | CAPTCHA ${captcha.enabled ? 'ON' : 'OFF'} | rotation ${rotation.enabled ? 'ON' : 'OFF'} (${rotation.events || 0} event${rotation.events === 1 ? '' : 's'})`;
-    const rotationLine = rotation.lastAt
-      ? `Rotation: ${rotation.events || 0} event${rotation.events === 1 ? '' : 's'}; last bot ${rotation.lastBotId || '-'} (${rotation.lastReason || 'route failure'})`
-      : `Rotation: ${rotation.events || 0} events; fresh routes first, then least-recently-used${rotation.onReconnect ? '; reconnect rotates' : ''}`;
-    const movement = ['follow', 'hold', 'dance'].includes(controllerStatus.movementMode) ? controllerStatus.movementMode : movementMode;
-    movementMode = movement;
-    const nativeLeader = controllerStatus.leader || nativeSelection || {};
-    const activeTab = nativeLeader.nativeActiveTab || nativeLeader.activeTab || null;
-    const waitingForRespawn = Boolean(nativeLeader.waitingForRespawn || nativeLeader.nativeWaitingForRespawn);
-    const leaderModeLine = waitingForRespawn
-      ? `Tab ${nativeLeader.waitingForRespawnTab || nativeLeader.nativeWaitingForRespawnTab || activeTab || '-'} dead - holding until it respawns`
-      : `Active Tab ${activeTab || '-'}${nativeLeader.authority ? ` (${nativeLeader.authority})` : ''}`;
-    const movementLine = `Movement: ${movement}${movement === 'dance' ? ` (${controllerStatus.dance?.amplitude || 180}px L/R)` : ''}`;
-     if (!versionMismatch) statusText.textContent = `Control: ${controlMode === 'bots' ? 'BOTS - GUI selected' : 'MAIN - native drag input'}\nLeader: ${center ? `${Math.round(center.x)}, ${Math.round(center.y)} (${center.pieces} piece${center.pieces === 1 ? '' : 's'})` : 'none - owned cell required'}\n${leaderModeLine}\n${movementLine}\nTag: ${controllerStatus.teamTag || 'none'}\nLifecycle: ${controllerStatus.connectedBots || 0} open | ${controllerStatus.verifiedBots || 0} verified | ${controllerStatus.readyUnspawnedBots || 0} ready | ${controllerStatus.aliveBots || 0} alive\n${routeLine}\n${cappLine}\n${rotationLine}\nVerify gate: ${activeVerify}/${controllerStatus.readiness?.maxConcurrentVerifications || '-'} active, ${queued} queued${degraded ? `\nPoll delayed: ${lastPollError} (${consecutivePollFailures}/${OFFLINE_AFTER_FAILURES})` : failing ? `\nBot ${failing.id}: ${failing.phase} - ${failing.lastError}` : ''}`;
-    panel.querySelector('#e3b-connected').textContent = controllerStatus.connectedBots || 0;
-    panel.querySelector('#e3b-ready').textContent = controllerStatus.readyUnspawnedBots || 0;
-    panel.querySelector('#e3b-alive').textContent = controllerStatus.aliveBots || 0;
-    panel.querySelector('#e3b-created').textContent = controllerStatus.createdBots || 0;
-    panel.querySelector('#e3b-capacity').textContent = controllerStatus.readiness?.observedUsableRouteCapacity ?? 0;
-    followEnabled = Boolean(controllerStatus.followEnabled);
-    followButton.textContent = `FOLLOW: ${followEnabled ? 'ON' : 'OFF'}`;
-    if (movementSelect) movementSelect.value = movementMode;
-    panel.querySelector('#e3b-freeze').textContent = controllerStatus.frozen ? 'UNFREEZE' : 'FREEZE';
-
-    if (!namingLoaded && controllerStatus.naming && nameTemplateInput && namesInput) {
-      nameTemplateInput.value = controllerStatus.naming.template;
-      const lines = Array(MAX_BOTS).fill('');
-      for (const item of controllerStatus.naming.overrides || []) if (item.id >= 1 && item.id <= MAX_BOTS) lines[item.id - 1] = item.name;
-      while (lines.length && !lines[lines.length - 1]) lines.pop();
-      namesInput.value = lines.join('\n');
-      namingLoaded = true;
-      nameTemplateInput.dispatchEvent(new Event('input'));
-    }
-
-    const bots = controllerStatus.bots || [];
-    panel.querySelector('#e3b-bot-summary').textContent = `${bots.length} bot${bots.length === 1 ? '' : 's'} | ${controllerStatus.readyUnspawnedBots || 0} ready | ${controllerStatus.aliveBots || 0} alive`;
-    if (bots === lastRenderedBots) return;
-    lastRenderedBots = bots;
-    botRows.replaceChildren();
-    if (!bots.length) {
-      const row = botRows.insertRow(); const cell = row.insertCell(); cell.colSpan = 5; cell.className = 'empty'; cell.textContent = 'No bots created. The lab is idle.';
-    } else {
-      for (const bot of bots) {
-        const row = botRows.insertRow();
-        const add = (main, detail = '') => { const cell = row.insertCell(); const value = document.createElement('div'); value.textContent = main; const small = document.createElement('small'); small.textContent = detail; cell.append(value, small); };
-        add(`#${bot.id} ${bot.nickname}`, bot.alive ? 'ALIVE' : 'not alive');
-        add(`${bot.connectionState} / ${bot.phase}`, `${bot.phaseAgeMs} ms`);
-        add(`${bot.verification?.state || '-'} / ${bot.spawn?.state || '-'}`, `attempts ${bot.spawn?.attempts || 0}`);
-        add(bot.movementState || 'IDLE', `distance ${bot.leaderDistance ?? '-'}`);
-        const routeDetail = bot.routeRotationCount
-          ? `rot ${bot.routeRotationCount}${bot.lastRotationReason ? ` · ${bot.lastRotationReason}` : ''}`
-          : `retry ${bot.retries || 0}`;
-        add(bot.proxy || 'DIRECT', bot.lastError || routeDetail);
-      }
-    }
-  }
-
-  function isTypingTarget(target) {
-    const tag = String(target?.tagName || '').toLowerCase();
-    return tag === 'input' || tag === 'textarea' || tag === 'select' || Boolean(target?.isContentEditable);
-  }
-
-  document.addEventListener('keydown', (event) => {
-    if (event.code === 'F8') {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      panelVisible = !panelVisible;
-      localStorage.setItem('e3b-botlab-panel', String(panelVisible));
-      panel?.classList.toggle('hidden', !panelVisible);
-      return;
-    }
-    if (isTypingTarget(event.target)) return;
-    if (controlMode === 'bots') {
-      if (event.code === 'Space' || event.code === 'KeyW') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-      if (event.code === 'Space' && !event.repeat) command('split');
-      if (event.code === 'KeyW' && !event.repeat) { wHeld = true; command('eject-start'); }
-      return;
-    }
-    if (!mirrorControls) return;
-    if (event.code === 'Space' && !event.repeat) command('split');
-    if (event.code === 'KeyW' && !event.repeat) command('eject-start');
-  }, true);
-
-  document.addEventListener('keyup', (event) => {
-    if (isTypingTarget(event.target)) return;
-    if (controlMode === 'bots' && event.code === 'KeyW') {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      wHeld = false;
-      command('eject-stop');
-      return;
-    }
-    if (mirrorControls && event.code === 'KeyW') command('eject-stop');
-  }, true);
-
-  installWebSocketObserver();
-  const bodyTimer = setInterval(() => {
-    if (!document.body) return;
-    clearInterval(bodyTimer);
-    createPanel();
-    pollStatus();
-  }, 25);
-  setInterval(sendLeaderUpdate, 50);
-  setInterval(pollStatus, 1000);
-  setInterval(serviceAutoSpawn, 1000);
-  setInterval(flushCapture, 250);
-  for (let workerId = 0; workerId < TOKEN_BROKER_CONCURRENCY; workerId += 1) {
-    setInterval(() => serviceTokenQueue(workerId), 100);
-  }
-
-  uw.ENDYMION_BOT_LAB = Object.freeze({
-    version: VERSION,
-    sockets: () => socketStates.map((state) => ({
-      index: state.index,
-      url: state.url,
-      open: state.open,
-      ownIds: state.world.ownIds.size,
-      center: ownedCenter(state),
-      bounds: state.world.bounds,
-      parseError: state.world.parseError,
-    })),
-    status: () => controllerStatus,
-    start: (botCount = 1) => command('start', { botCount: Math.min(MAX_BOTS, Math.max(1, Number(botCount) || 1)) }),
-    stop: () => command('stop'),
-    split: () => command('split'),
-    ejectStart: () => command('eject-start'),
-    ejectStop: () => command('eject-stop'),
-    spawn: () => command('spawn'),
-    reconnect: () => command('reconnect'),
-    controlMain: () => setControlMode('main'),
-    controlBots: () => setControlMode('bots'),
-    toggleControl: () => toggleControlMode(),
-  }, true);
-})();
   class Storage {
     static ["init"]() {
       this.prefix = "MX-";
@@ -2640,7 +1581,7 @@
     static ["fetchServerinfo"]() {
       let rp;
       let aan = new XMLHttpRequest();
-      aan.open("GET", "https://beta.3rb.io/php/Servers.php", false);
+      aan.open("GET", "https://3rb.io/php/Servers.php", false);
       aan.send();
       try {
         rp = JSON.parse(aan.responseText);
@@ -6112,12 +5053,13 @@
       };
       WorldData.init();
     }
-    // Each tab needs its OWN Turnstile widget/container. Rendering ".cf-turnstile"
-    // twice targets the same single element, so the 2nd render() silently fails
-    // to bind and tab 2's promise never resolves -> handshake2 never completes
-    // -> ws2 never sends its auth packet -> server drops it as idle.
+    // Each tab needs its OWN reCAPTCHA widget/container. Rendering the same
+    // container twice targets the same single element, so the 2nd render()
+    // silently fails to bind and tab 2's promise never resolves -> handshake2
+    // never completes -> ws2 never sends its auth packet -> server drops it as
+    // idle.
     // The captcha queue serializes token requests so the standby tab never
-    // renders a third Turnstile widget while an earlier one is still pending.
+    // renders a third widget while an earlier one is still pending.
     static ["getToken"](alq) {
       const task = this.captchaQueue.then(() => this._getToken(alq));
       this.captchaQueue = task.catch(() => {});
@@ -6128,61 +5070,59 @@
         if (alq <= 1) {
           Notifications.warn("Drag+", "Solving captcha, please wait..");
         }
-        if (!window.turnstile) {
-          return dq(new Error("Turnstile SDK not loaded"));
+        if (!window.grecaptcha || !window.grecaptcha.render) {
+          return dq(new Error("reCAPTCHA SDK not loaded"));
         }
         // remember whoever is currently waiting for THIS tab's token
         this.pendingResolvers[alq] = { resolve: lv, reject: dq };
 
         const mu = alq === 1 ? "#cf-turnstile-1" : alq === 2 ? "#cf-turnstile-2" : "#cf-turnstile-3";
 
-        if (undefined !== this.widgetIds[alq]) {
-          // A widget from a PREVIOUS connect already lives in this
-          // container. reset() alone doesn't reliably re-trigger the
-          // callback for a managed/invisible challenge - on reconnect this
-          // left the promise hanging forever. remove() fully tears the old
-          // widget down so the container is empty again and render() below
-          // can cleanly create a fresh one - the same path that already
-          // works for the very first connect. Wrapped in try/catch since a
-          // widget Cloudflare already auto-expired/GC'd internally could
-          // make remove() itself throw, which would otherwise silently
-          // reject this whole getToken() call before render() ever runs.
-          try {
-            window.turnstile.remove(this.widgetIds[alq]);
-          } catch (dg) {}
-          delete this.widgetIds[alq];
-        }
-
-        const aai = window.turnstile.render(mu, {
-          sitekey: "0x4AAAAAADre-KxtZJu7P6nr",
-          callback: (xs, abv) => {
-            const rz = this.pendingResolvers[alq];
-            if (!abv && !xs) {
-              return Notifications.warn("Drag+", "Unexpected response from turnstile API.");
-            }
-            if ($("#loading-screen") && $("#loading-screen").fadeOut(500)) {
-              $("#loading-screen").remove();
-            }
-            PacketSender.handleDisabledProperty(false);
-            Notifications.warn("Drag+", "Captcha has been solved successfully for Tab " + alq);
-            if (rz) {
-              return rz.resolve(xs);
-            }
-          },
-          "expired-callback": () => {
-            const rz = this.pendingResolvers[alq];
-            if (rz) {
-              rz.reject(new Error("Turnstile token expired for tab " + alq));
-            }
-          },
-          "error-callback": () => {
-            const rz = this.pendingResolvers[alq];
-            if (rz) {
-              rz.reject(new Error("Turnstile error for tab " + alq));
-            }
-          },
-        });
-        this.widgetIds[alq] = aai;
+        // The 2026 protocol server validates Google reCAPTCHA tokens
+        // (sitekey of 3rb.io itself). One invisible widget per tab: render
+        // it on first use, reset + re-execute on later reconnects.
+        const run = () => {
+          let wid = this.widgetIds[alq];
+          if (undefined === wid) {
+            wid = window.grecaptcha.render(document.querySelector(mu), {
+              sitekey: "6Lea_z0tAAAAAPeJ6JiJnnKGly6s-zk4u8bwJeJ3",
+              size: "invisible",
+              callback: (xs) => {
+                const rz = this.pendingResolvers[alq];
+                if (!xs) {
+                  return Notifications.warn("Drag+", "Unexpected response from reCAPTCHA API.");
+                }
+                if ($("#loading-screen") && $("#loading-screen").fadeOut(500)) {
+                  $("#loading-screen").remove();
+                }
+                PacketSender.handleDisabledProperty(false);
+                Notifications.warn("Drag+", "Captcha has been solved successfully for Tab " + alq);
+                if (rz) {
+                  return rz.resolve(xs);
+                }
+              },
+              "expired-callback": () => {
+                const rz = this.pendingResolvers[alq];
+                if (rz) {
+                  rz.reject(new Error("reCAPTCHA token expired for tab " + alq));
+                }
+              },
+              "error-callback": () => {
+                const rz = this.pendingResolvers[alq];
+                if (rz) {
+                  rz.reject(new Error("reCAPTCHA error for tab " + alq));
+                }
+              },
+            });
+            this.widgetIds[alq] = wid;
+          } else {
+            try {
+              window.grecaptcha.reset(wid);
+            } catch (dg) {}
+          }
+          window.grecaptcha.execute(wid);
+        };
+        window.grecaptcha.ready(run);
       });
     }
     static ["connect"](hy, aff) {
@@ -6201,7 +5141,7 @@
     }
     static ["createSocket"](slot) {
       if (!this.ip) return null;
-      const socket = new WebSocket(this.ip, "ghmarab");
+      const socket = new WebSocket(this.ip, "algamees");
       if (1 === slot) this.ws = socket;
       else if (2 === slot) this.ws2 = socket;
       else this.ws3 = socket;
@@ -6216,7 +5156,7 @@
       socket.onerror = () => this.onError(slot);
     }
     // Standby Tab 3 opens only once both active tabs are authenticated, so
-    // the three Turnstile challenges never need to overlap.
+    // the three reCAPTCHA challenges never need to overlap.
     static ["scheduleBackup"](delay = 1500) {
       clearTimeout(this.backupRetryTimer);
       if (this.intentionalDisconnect || !this.ip || !this.connected || !this.connected2 || this.ws3Open || this.backupConnecting) return;
@@ -6667,16 +5607,23 @@
       }
     }
     static ["handleChat"](yn) {
-      // id1 is the sender's real player id (matches cell.ownerId/WorldData.pID
-      // namespace) - needed so a chat message's nick can be right-clicked
-      // into the same party-invite menu as a map cell.
+      // 2026 chat packet: int32 senderId, int32 target, uint8 r, string a,
+      // uint8x3 color, string msg, string nick, string l, uint8 c, uint8 u,
+      // string d. id1 is the sender's real player id (matches cell.ownerId/
+      // WorldData.pID namespace) - needed so a chat message's nick can be
+      // right-clicked into the same party-invite menu as a map cell.
       const mz = yn.readInt32();
       yn.readInt32();
+      yn.readUInt8();
+      yn.readStringZeroUtf8();
       yn.readUInt8();
       yn.readUInt8();
       yn.readUInt8();
       var cb = yn.readStringZeroUtf8().replace("[]", "");
       var pv = yn.readStringZeroUtf8();
+      yn.readStringZeroUtf8();
+      yn.readUInt8();
+      yn.readUInt8();
       yn.readStringZeroUtf8();
       Notifications.gameChat(cb, pv, mz);
     }
@@ -6747,7 +5694,9 @@
         akq.y = tz;
         akq.radius = wn;
         akq.lastUpdateTime = GameLoop.time;
-        ajl = vi.readUInt8();
+        // The 2026 protocol widened the per-cell flags word from 8 to 16
+        // bits (adds vip/gold/sweet bits at 256/512/1024) - must read 16.
+        ajl = vi.readUInt16();
         sf = !!(1 & ajl);
         alm = !!(4 & ajl);
         alx = !!(8 & ajl);
@@ -7169,7 +6118,7 @@
       // reconnect state machine dropping in-flight sends) was a symptom of
       // that abstraction layer, not the actual network. A raw WebSocket
       // has none of that hidden machinery - what you see here IS the
-      // connection logic. MUST be wss:// (not https://): beta.3rb.io is
+      // connection logic. MUST be wss:// (not https://): 3rb.io is
       // loaded over HTTPS, and browsers silently drop any plain ws://
       // connection an HTTPS page tries to open (mixed content) - the
       // socket just never opens, no error is ever thrown. If this is
@@ -8204,7 +7153,7 @@
       }
     }
     static async ["getKnownSkins"]() {
-      var ne = await fetch("https://beta.3rb.io/php/Skins.php?type=free");
+      var ne = await fetch("https://3rb.io/php/Skins.php?type=free");
       var acb = await ne.json();
       var ts = Date.now();
       for (let nh = 0; nh < acb.length; nh++) {
