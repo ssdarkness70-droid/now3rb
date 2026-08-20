@@ -752,7 +752,7 @@
       $("#skin").val(ze.skin);
       $("#skin2").val(ze.skin2 || "");
       $("#arbSkin").val(ze.arbSkin);
-      Player.nick = "" === ze.nick ? "Unnamed Cell" : ze.nick;
+      Player.nick = "" === ze.nick ? "An unnamed cell" : ze.nick;
       Player.skin = ze.skin;
       Player.skin2 = ze.skin2 || "";
       Storage.set("profiles", "profile" + this.selected, ze);
@@ -775,7 +775,7 @@
       }
       ht.nick = jl;
       Storage.set("profiles", "profile" + this.selected, ht);
-      Player.nick = "" === jl ? "Unnamed Cell" : jl;
+      Player.nick = "" === jl ? "An unnamed cell" : jl;
     }
     static ["setarbSkin"]() {
       var uu = $("#arbSkin").val();
@@ -2451,7 +2451,7 @@
       }
       return fi;
     }
-    static ["gameChat"](dg, zf, ais) {
+    static ["gameChat"](dg, zf, ais, mt) {
       // Build up a nick->id memory from every attributed message we see -
       // the invite notification itself often arrives as a system-style
       // message (id1 <= 0, not attributed to the inviter), and the inviter
@@ -2463,6 +2463,22 @@
         return;
       }
       const akh = this.alert(dg, zf, "game");
+      if (akh) {
+        // Render the sender's real color, a crown for VIPs, and gray for
+        // muted senders - the same fields the real client uses. mt comes
+        // from handleChat's packet parse (opcode 86).
+        const nickEl = akh.find(".nick");
+        if (mt && nickEl.length) {
+          if (mt.muted) {
+            nickEl.css("color", "#7f7f7f");
+          } else if (mt.vip) {
+            nickEl.prepend("👑 ");
+          }
+          if ("number" === typeof mt.r) {
+            nickEl.css("color", "#" + [mt.r, mt.g, mt.b].map((c) => ("0" + c.toString(16)).slice(-2)).join(""));
+          }
+        }
+      }
       if (0 < ais && akh) {
         akh.find(".nick").on("contextmenu", (ahp) => {
           ahp.preventDefault();
@@ -2951,6 +2967,14 @@
     static ["enter"]() {
       if (this.isOpened) {
         if (this.isFocused) {
+          if (!Account.loggedIn) {
+            this.input.val("");
+            this.input.blur();
+            this.container.hide();
+            this.isOpened = false;
+            Notifications.warn("Chat", "You must be registered and at least level 5 to use the chat");
+            return;
+          }
           let afp = this.input.val();
           if (0 < afp.length && 100 < afp.length) {
             afp = afp.substring(0, 100);
@@ -4380,7 +4404,8 @@
         return false;
       }
       let pk = cn.nick.substring(cn.nick.indexOf("}") + 1) || "";
-      const xb = this.nickCaches.get(pk) || this.newNickCache(pk);
+      const key = (cn.vip ? "v:" : "") + pk;
+      const xb = this.nickCaches.get(key) || this.newNickCache(key);
       xb.lastUsedAt = GameLoop.time;
       const gc = 50 > this.getScreenRadius(cn.animRadius) ? 0 : 1;
       const uj = xb.level[gc];
@@ -4390,18 +4415,21 @@
       const ac = this.getNewCanvas();
       const xd = ac.getContext("2d");
       const lx = (50 * (gc + 1) * Theme.cellNickSize) / 100;
+      // VIP cells render their name in gold (no crown in-game - the crown
+      // stays in chat), matching the real client (cell flags bit 256 = vip).
+      const disp = pk;
       ac.height = 0 | (1.2 * lx);
-      ac.width = 0 | (1.2 * this.getNickWidth(pk, lx));
+      ac.width = 0 | (1.2 * this.getNickWidth(disp, lx));
       xd.font = "700 " + (0 | lx) + "px " + Theme.nickFont;
       xd.textBaseline = "middle";
       xd.textAlign = "center";
       if ("normal" === Settings.nickShadow) {
-        xd.strokeStyle = Theme.nickStrokeColor;
+        xd.strokeStyle = cn.vip ? "#6b4f00" : Theme.nickStrokeColor;
         xd.lineWidth = 6 * (gc + 1);
-        xd.strokeText(pk, ac.width >> 1, ac.height >> 1);
+        xd.strokeText(disp, ac.width >> 1, ac.height >> 1);
       } else {
         if ("performance" === Settings.nickShadow) {
-          xd.fillStyle = Theme.nickStrokeColor;
+          xd.fillStyle = cn.vip ? "#6b4f00" : Theme.nickStrokeColor;
           xd.globalAlpha = 0.75;
           const aga = 0 | (ac.width / 1.2);
           const xj = 0 | (ac.height / 1.2);
@@ -4409,8 +4437,8 @@
           xd.globalAlpha = 1;
         }
       }
-      xd.fillStyle = Theme.nickColor;
-      xd.fillText(pk, ac.width >> 1, ac.height >> 1);
+      xd.fillStyle = cn.vip ? "#fbb040" : Theme.nickColor;
+      xd.fillText(disp, ac.width >> 1, ac.height >> 1);
       xb.level[gc] = ac;
       return ac;
     }
@@ -5141,7 +5169,7 @@
     }
     static ["createSocket"](slot) {
       if (!this.ip) return null;
-      const socket = new WebSocket(this.ip, "algamees");
+      const socket = new WebSocket(this.ip, "d1elnjtfbyzq7a");
       if (1 === slot) this.ws = socket;
       else if (2 === slot) this.ws2 = socket;
       else this.ws3 = socket;
@@ -5534,6 +5562,10 @@
         this.handlePartyCode(aam);
       } else if (87 === ahy) {
         this.handleParty(aam);
+      } else if (88 === ahy && 1 === ii) {
+        this.handleLevel(aam);
+      } else if (154 === ahy && 1 === ii) {
+        this.handleSweets(aam);
       }
       if (86 === ahy && 1 === ii) {
         this.handleChat(aam);
@@ -5565,6 +5597,21 @@
       if (aia && PacketSender.chekConnection(2)) {
         PacketSender.joinParty(fg, 2);
       }
+    }
+    static ["handleSweets"](akl) {
+      // Opcode 154: sweet pickup (uint16 count + x/y). Track the running
+      // total for the status line; refresh is throttled by updateUI call.
+      const gained = akl.readUInt16();
+      if (0 < gained) {
+        Account.sweets += gained;
+        Account.updateUI();
+      }
+    }
+    static ["handleLevel"](ajz) {
+      // Opcode 88: server pushes the account's total XP (uint32, little
+      // endian) + optional bonus coins (uint8 flag + uint32). We only need
+      // the XP to track the current level and detect level-ups.
+      Account.setXp(ajz.readUInt32());
     }
     static ["handleParty"](akb) {
       const tc = akb.readUInt16();
@@ -5614,18 +5661,18 @@
       // right-clicked into the same party-invite menu as a map cell.
       const mz = yn.readInt32();
       yn.readInt32();
-      yn.readUInt8();
+      const vip = yn.readUInt8();
       yn.readStringZeroUtf8();
-      yn.readUInt8();
-      yn.readUInt8();
-      yn.readUInt8();
+      const cr = yn.readUInt8();
+      const cg = yn.readUInt8();
+      const cb2 = yn.readUInt8();
       var cb = yn.readStringZeroUtf8().replace("[]", "");
       var pv = yn.readStringZeroUtf8();
       yn.readStringZeroUtf8();
       yn.readUInt8();
-      yn.readUInt8();
+      const muted = yn.readUInt8();
       yn.readStringZeroUtf8();
-      Notifications.gameChat(cb, pv, mz);
+      Notifications.gameChat(cb, pv, mz, { r: cr, g: cg, b: cb2, vip: !!vip, muted: !!muted });
     }
     static ["worldUpdate"](vi, vd = 1) {
       GameLoop.refreshTime();
@@ -5738,6 +5785,7 @@
         }
         akq.nick = alx ? vi.readStringZeroUtf8() : null;
         akq.bNick = ale ? vi.readStringZeroUtf8() : null;
+        akq.vip = !!(256 & ajl);
         akq.isVirus = sf;
         akq.isEjected = jd;
         // classify AFTER isVirus/isEjected/ownerId are up to date for this
@@ -5929,8 +5977,35 @@
       [1, 2, 3].forEach((slot) => this.stopPingLoop(slot));
     }
     static ["handshake1"](ahn) {
-      const px = new Uint8Array([255, 0, 0]);
-      WsConnection.send(px, ahn);
+      // Login packet: [255] + UTF-16LE(string) + zero terminator (00 00).
+      // Guest (no account) sends an empty string -> [255, 0, 0], which is
+      // byte-for-byte what the old client always sent. A logged-in account
+      // sends [255, unicode(uuid|gameToken), 0, 0].
+      // Only Tab 1 carries the account: the game server allows a single
+      // connection per account (concurrent-login protection), so Tabs 2/3
+      // must stay guests or they get kicked in a reconnect loop.
+      const str = 1 === Number(ahn) ? Account.buildLoginString(Account.uuid) : "";
+      console.log("Drag+ Login packet (tab " + ahn + "): " + (str ? (str.length > 24 ? str.slice(0, 24) + "..." : str) : "guest"));
+      if (!str) {
+        const px = new Uint8Array([255, 0, 0]);
+        WsConnection.send(px, ahn);
+        return;
+      }
+      const bytes = new Uint8Array(3 + str.length * 2);
+      bytes[0] = 255;
+      for (let i = 0; i < str.length; i++) {
+        const cc = str.charCodeAt(i);
+        bytes[1 + i * 2] = cc & 0xff;
+        bytes[2 + i * 2] = (cc >> 8) & 0xff;
+      }
+      WsConnection.send(bytes, ahn);
+    }
+    static ["resendLogin"]() {
+      [1, 2, 3].forEach((tab) => {
+        if ((1 === tab && WsConnection.connected) || (2 === tab && WsConnection.connected2) || (3 === tab && WsConnection.connected3)) {
+          this.handshake1(tab);
+        }
+      });
     }
     static async ["handshake2"](oq) {
       if (3 !== oq && WsConnection.connected && WsConnection.connected2) {
@@ -5974,6 +6049,15 @@
       if (command === "/kill" || command === "/recycle") {
         WsConnection.recycleActiveCell();
         return;
+      }
+      // Only Tab 1 carries the logged-in account, so route chat there
+      // (guests on Tabs 2/3 get rejected by the server anyway). Fall back
+      // to the active tab if Tab 1 is not currently connected.
+      if (Account.loggedIn) {
+        jj = 1;
+        if (!this.chekConnection(jj)) {
+          jj = Player.typeID;
+        }
       }
       if (this.chekConnection(jj)) {
         const gh = unescape(encodeURIComponent(am));
@@ -6019,7 +6103,7 @@
       if (this.chekConnection(n) && ((1 === n && !Player._isAlive) || (2 === n && !Player._isAlive2))) {
         Camera.isSpectating = false;
         if ("" === Player.nick) {
-          Player.nick = "Unnamed cell";
+          Player.nick = "An unnamed cell";
         }
         let xt = unescape(encodeURIComponent(Player.nick));
         let h = unescape(encodeURIComponent("free/" + TeamList.arbSkin));
@@ -6029,6 +6113,12 @@
         if (Player.arbSkin) {
           ul.s = h;
           ul.w = "";
+        }
+        // VIP flag: the real client sends v:true in the spawn/Name packet so
+        // the server marks the connection as VIP (gold color + crown on the
+        // cell, isVip on its chat messages). Tab 1 carries the account.
+        if (1 === n && Account.isVip()) {
+          ul.v = true;
         }
         const ur = JSON.stringify(ul);
         const ng = ur.length;
@@ -6105,6 +6195,303 @@
         rn.setUint8(1, 2, true);
         this.sendPacket(rn, aiv);
       }
+    }
+  }
+  class Account {
+    static ["init"]() {
+      this.uuid = localStorage.getItem("active_session_id") || "";
+      this.nick = localStorage.getItem("active_session_nick") || "";
+      this.gameToken = null;
+      this.gameTokenAt = 0;
+      this.levels = null;
+      this.xp = -1;
+      this.level = 0;
+      this.levelAnnounced = false;
+      this.coins = 0;
+      this.sweets = 0;
+      this.vipEndAt = null;
+      this.xpBoost = null;
+      this.massBoost = null;
+      this._xpPoll = null;
+      window.authResponse = (res) => {
+        try {
+          this.onAuthResponse(res);
+        } catch (e) {
+          console.log("authResponse error", e);
+        }
+      };
+      window.addEventListener("storage", (e) => this.handleStorageChange(e));
+      this.bindUI();
+      this.updateUI();
+      if (this.loggedIn) {
+        this.refreshGameToken();
+        this.loadLevels();
+        this.startXpPoll();
+      }
+    }
+    static get ["loggedIn"]() {
+      return !!this.uuid && "logout" !== this.uuid;
+    }
+    static ["buildLoginString"](u) {
+      if (!u) {
+        return "";
+      }
+      if ("logout" === u || 0 === u.indexOf("locked-")) {
+        return u;
+      }
+      return this.gameToken ? u + "|" + this.gameToken : u;
+    }
+    static ["openLogin"](provider) {
+      // Match the game's own popup (createWindow) exactly: same window name
+      // "3rb.io", same "scrollbars=yes, width=..., height=..., top=..., left=..."
+      // features string. window.open from a Tampermonkey sandbox is often a
+      // no-op (silently returns null, nothing opens), so route through the
+      // real page window (unsafeWindow) when available - the popup needs the
+      // real opener so php/Auth.php can call window.opener.authResponse().
+      const w = "undefined" !== typeof unsafeWindow ? unsafeWindow : window;
+      const top = (w.screenTop || w.screenY || 0) + ((w.outerHeight || w.innerHeight || 0) - 520) / 2;
+      const left = (w.screenLeft || w.screenX || 0) + ((w.outerWidth || w.innerWidth || 0) - 400) / 2;
+      const features = "scrollbars=yes, width=400, height=520, top=" + top + ", left=" + left;
+      const win = w.open("php/Auth.php?provider=" + provider, "3rb.io", features);
+      if (!win) {
+        Notifications.warn("Login", "Login popup was blocked - please allow popups for 3rb.io and try again.");
+      }
+      return win;
+    }
+    static ["onAuthResponse"](e) {
+      if (!e || e.error) {
+        Notifications.warn("Login", (e && e.error) || "Login error!");
+        return;
+      }
+      this.uuid = e.uuid || "";
+      this.nick = e.Name || "";
+      if (this.uuid) {
+        localStorage.setItem("active_session_id", this.uuid);
+        localStorage.setItem("active_session_nick", this.nick);
+      }
+      this.gameToken = null;
+      this.gameTokenAt = 0;
+      this.levels = (e && e.Shop && e.Shop.Levels) || this.levels;
+      this.coins = parseInt(e && e.Coins) || 0;
+      this.sweets = parseInt(e && e.Sweets) || 0;
+      if (e && e.vipEndAt) this.vipEndAt = e.vipEndAt;
+      if (e && e["XP Boost"]) this.xpBoost = e["XP Boost"];
+      if (e && e["Mass Boost"]) this.massBoost = e["Mass Boost"];
+      this.refreshGameToken();
+      this.updateUI();
+      PacketSender.resendLogin();
+      const axp = parseInt(e && e.XP);
+      if (!isNaN(axp) && 0 <= axp) {
+        this.setXp(axp);
+      }
+      this.loadLevels();
+      this.startXpPoll();
+    }
+    static ["refreshGameToken"]() {
+      if (!this.loggedIn) {
+        this.gameToken = null;
+        return;
+      }
+      if (this.gameToken && Date.now() - this.gameTokenAt < 24e4) {
+        return;
+      }
+      fetch("https://3rb.io/api/auth/game-token", { credentials: "include" })
+        .then((r) => {
+          if (!r.ok) {
+            Notifications.warn("Login", "Game token failed (HTTP " + r.status + ") - chat may stay locked");
+            throw new Error("game-token status " + r.status);
+          }
+          return r.json();
+        })
+        .then((d) => {
+          const tk = d && (d.token || (d.data && d.data.token));
+          if (tk) {
+            this.gameToken = tk;
+            this.gameTokenAt = Date.now();
+            Notifications.command("Login", "Game token ready");
+            PacketSender.resendLogin();
+          } else {
+            Notifications.warn("Login", "Game token: no token in response");
+          }
+        })
+        .catch(() => {});
+    }
+    static ["loadLevels"]() {
+      // Level thresholds come from the account's Shop.Levels table. Prefer
+      // what php/Auth.php returns in authResponse; fall back to auth/me.
+      if (!this.loggedIn) return;
+      if (this.levels && this.levels.length) {
+        this.announceLevel();
+        return;
+      }
+      this.refreshAccountData();
+    }
+    static ["startXpPoll"]() {
+      // Lightweight live account refresh (one small request every 40s) so the
+      // XP/level updates while playing without needing a logout/login. Safe
+      // for guests: only runs while logged in. Kept tiny to avoid any lag.
+      if (this._xpPoll || !this.loggedIn) return;
+      this._xpPoll = setInterval(() => {
+        if (!this.loggedIn) {
+          this.stopXpPoll();
+          return;
+        }
+        this.refreshAccountData();
+      }, 40000);
+    }
+    static ["stopXpPoll"]() {
+      if (this._xpPoll) {
+        clearInterval(this._xpPoll);
+        this._xpPoll = null;
+      }
+    }
+    static ["refreshAccountData"]() {
+      if (!this.loggedIn) return;
+      fetch("https://3rb.io/api/auth/me", { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("status " + r.status))))
+        .then((d) => {
+          const body = d && d.data ? d.data : d;
+          if (body) {
+            this.applyAccountData(body);
+          }
+        })
+        .catch(() => {});
+    }
+    static ["applyAccountData"](body) {
+      if (body.Shop && body.Shop.Levels && body.Shop.Levels.length) {
+        this.levels = body.Shop.Levels;
+      }
+      const xp = parseInt(body.XP);
+      if (!isNaN(xp) && 0 <= xp) {
+        this.setXp(xp);
+      }
+      const coins = parseInt(body.Coins);
+      if (!isNaN(coins) && 0 <= coins) {
+        this.coins = coins;
+      }
+      const sweets = parseInt(body.Sweets);
+      if (!isNaN(sweets) && 0 <= sweets) {
+        this.sweets = sweets;
+      }
+      if (body.vipEndAt) this.vipEndAt = body.vipEndAt;
+      if (body["XP Boost"]) this.xpBoost = body["XP Boost"];
+      if (body["Mass Boost"]) this.massBoost = body["Mass Boost"];
+      this.updateUI();
+    }
+    static ["isVip"]() {
+      if (!this.vipEndAt) return false;
+      const t = new Date(this.vipEndAt).getTime();
+      return !isNaN(t) && t > Date.now();
+    }
+    static ["boostActive"](val) {
+      if (!val) return false;
+      const t = new Date(val).getTime();
+      return isNaN(t) || t > Date.now();
+    }
+    static ["levelForXp"](xp) {
+      let cur = null;
+      for (let i = 0; i < this.levels.length; i++) {
+        if (this.levels[i].XP <= xp) {
+          cur = this.levels[i];
+        } else {
+          break;
+        }
+      }
+      return cur;
+    }
+    static ["setXp"](xp) {
+      if (0 > xp || !this.levels || !this.levels.length) return;
+      const wasKnown = 0 <= this.xp;
+      const oldLevel = this.level;
+      this.xp = xp;
+      const cur = this.levelForXp(xp);
+      if (!cur) return;
+      this.level = cur.Level;
+      if (wasKnown && oldLevel && cur.Level > oldLevel) {
+        const coins = parseInt(cur.Coins);
+        if (0 < coins) {
+          this.coins += coins;
+          this.updateUI();
+        }
+        Notifications.command(
+          "Level",
+          "Level Up! You reached level " + cur.Level + (0 < coins ? " (+" + coins.toLocaleString() + " Coins)" : "")
+        );
+      }
+      this.announceLevel();
+    }
+    static ["announceLevel"]() {
+      if (!this.levels || !this.levels.length) return;
+      if (this.levelAnnounced || 0 > this.xp) return;
+      this.levelAnnounced = true;
+      Notifications.command("Level", "Your level: " + this.level + " (" + this.xp + " XP)");
+    }
+    static ["logout"]() {
+      this.stopXpPoll();
+      this.uuid = "logout";
+      this.gameToken = null;
+      PacketSender.resendLogin();
+      this.uuid = "";
+      this.nick = "";
+      this.gameTokenAt = 0;
+      localStorage.removeItem("active_session_id");
+      localStorage.removeItem("active_session_nick");
+      fetch("php/Auth.php?logout", { credentials: "include" }).catch(() => {});
+      this.updateUI();
+    }
+    static ["handleStorageChange"](e) {
+      if ("active_session_id" !== e.key) {
+        return;
+      }
+      const v = localStorage.getItem("active_session_id");
+      if (v === this.uuid) {
+        return;
+      }
+      this.uuid = v || "";
+      this.nick = this.uuid ? localStorage.getItem("active_session_nick") || "" : "";
+      this.gameToken = null;
+      this.gameTokenAt = 0;
+      if (this.loggedIn) {
+        this.refreshGameToken();
+        this.startXpPoll();
+      }
+      this.updateUI();
+      PacketSender.resendLogin();
+    }
+    static ["bindUI"]() {
+      // Google/Discord login are native anchors (href + target="_blank" +
+      // rel="opener") so the browser opens the Auth.php popup itself - no
+      // window.open needed (the Tampermonkey sandbox swallows those). The
+      // relay/authResponse still wires up through window.opener on the page.
+      $(document).on("click", "#account-status-logout", (e) => {
+        e.preventDefault();
+        this.logout();
+      });
+    }
+    static ["updateUI"]() {
+      if (!this.loggedIn) {
+        $("#account-login").show();
+        $("#account-status-info").text("Anonymous");
+        $("#account-status-logout").hide();
+        return;
+      }
+      $("#account-login").hide();
+      const parts = [];
+      parts.push("👤 " + (this.nick || (this.uuid.length > 10 ? this.uuid.slice(0, 10) + "..." : this.uuid)));
+      if (this.isVip()) {
+        parts.push("[VIP]");
+      }
+      parts.push("💰 " + (this.coins || 0).toLocaleString());
+      if (0 < this.sweets) {
+        parts.push("🍬 " + this.sweets.toLocaleString());
+      }
+      if (this.boostActive(this.xpBoost)) {
+        parts.push("⚡ XP Boost");
+      } else if (this.boostActive(this.massBoost)) {
+        parts.push("⚡ Mass Boost");
+      }
+      $("#account-status-info").text(parts.join(" │ "));
+      $("#account-status-logout").show();
     }
   }
   class RelayWs {
@@ -7188,6 +7575,7 @@
       Camera.init();
       RelayData.init();
       PartyManager.init();
+      Account.init();
       Renderer.init();
       this.loop = new RafLoop(() => {
         this.run();
