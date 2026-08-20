@@ -6666,7 +6666,15 @@
       return zn;
     }
     static ["connect"]() {
-      if ("undefined" === typeof WebSocket) {
+      // 3rb.io now serves a strict Content-Security-Policy whose connect-src
+      // only allows the game's own origins (wss://3rb.io, wss://alpha.3rb.io:*),
+      // so a page-context WebSocket to this external relay is silently blocked
+      // (the socket just never opens, no error thrown). GM_websocket connects
+      // from Tampermonkey's privileged context, which page CSP cannot block -
+      // the only way the relay survives on the hardened origin. Falls back to
+      // the native constructor when not running under Tampermonkey.
+      const WsCtor = "function" === typeof GM_websocket ? GM_websocket : WebSocket;
+      if ("undefined" === typeof WsCtor) {
         return console.log("Multibox sync: WebSocket is not available in this page, cannot connect to " + this.url);
       }
       if (this.reconnectTimer) {
@@ -6674,7 +6682,7 @@
         this.reconnectTimer = null;
       }
       const lk = this.url + "?room=" + encodeURIComponent(this.room);
-      this.ws = new WebSocket(lk);
+      this.ws = new WsCtor(lk);
       this.ws.binaryType = "arraybuffer";
       this.ws.onopen = () => {
         console.log("Multibox sync: connected to " + this.url);
@@ -6780,6 +6788,18 @@
       RelaySender.init();
     }
     static ["onMessage"](fy) {
+      // GM_websocket (used to dodge the page CSP, see connect()) may deliver
+      // binary frames as Blob instead of ArrayBuffer on some engines - the
+      // synchronous parse path needs an ArrayBuffer, so convert async in that
+      // case. Native WebSocket with binaryType="arraybuffer" keeps the fast path.
+      const d = fy && fy.data;
+      if (d && "undefined" !== typeof Blob && d instanceof Blob) {
+        d.arrayBuffer().then((ab) => {
+          fy.data = ab;
+          RelayParser.parse(fy);
+        });
+        return;
+      }
       RelayParser.parse(fy);
     }
     static ["onClose"]() {
