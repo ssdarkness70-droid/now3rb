@@ -5206,6 +5206,26 @@
     }
     static ["createSocket"](slot) {
       if (!this.ip) return null;
+      // 2026 proto-map negotiation state (see handleProto). Each socket starts
+      // "waiting" for the server's MapInit packet; every packet we send while
+      // waiting is queued and flushed once the mapping is resolved.
+      this._protoWaiting = this._protoWaiting || {};
+      this._protoQueue = this._protoQueue || {};
+      this._protoSend = this._protoSend || {};
+      this._protoRecv = this._protoRecv || {};
+      this._protoWaiting[slot] = true;
+      this._protoQueue[slot] = [];
+      this._protoSend[slot] = null;
+      this._protoRecv[slot] = null;
+      clearTimeout(this["_protoTimer" + slot]);
+      this["_protoTimer" + slot] = setTimeout(() => {
+        if (this._protoWaiting && this._protoWaiting[slot]) {
+          this._protoWaiting[slot] = false;
+          this._protoSend[slot] = null;
+          this._protoRecv[slot] = null;
+          this.flushProtoQueue(slot);
+        }
+      }, 700);
       const socket = new WebSocket(this.ip, "d1elnjtfbyzq7a");
       if (1 === slot) this.ws = socket;
       else if (2 === slot) this.ws2 = socket;
@@ -5282,12 +5302,23 @@
     }
     static ["send"](acr, yj) {
       this.packetCount.out++;
+      if (this._protoWaiting && this._protoWaiting[yj]) {
+        (this._protoQueue[yj] = this._protoQueue[yj] || []).push(acr);
+        return;
+      }
+      let payload = acr;
+      if (this._protoSend && this._protoSend[yj]) {
+        const remap = new Uint8Array(acr.byteLength);
+        remap.set(new Uint8Array(acr));
+        remap[0] = this._protoSend[yj][remap[0]];
+        payload = remap.buffer;
+      }
       if (1 === yj && this.wsOpen) {
-        this.ws.send(acr);
+        this.ws.send(payload);
       } else if (2 === yj && this.ws2Open) {
-        this.ws2.send(acr);
+        this.ws2.send(payload);
       } else if (3 === yj && this.ws3Open) {
-        this.ws3.send(acr);
+        this.ws3.send(payload);
       }
     }
     static ["onOpen"](nq) {
@@ -5298,6 +5329,15 @@
     }
     static ["onMessage"](alh, adu) {
       this.packetCount["in"]++;
+      // 2026 proto-map negotiation: the server may open with a MapInit packet
+      // (opcode 240, 546 bytes, byte[1]===1). While we haven't resolved it,
+      // check the FIRST incoming frame - if it's MapInit, apply the opcode
+      // remap tables and ack; if it's anything else the server is legacy and
+      // we flush the queued handshake untouched. A consumed MapInit frame is
+      // not fed into the normal parser.
+      if (this._protoWaiting && this._protoWaiting[adu] && this.handleProto(alh, adu)) {
+        return;
+      }
       // Tab 3 is a transport-only hot standby. Its handshake is completed in
       // onOpen(), but it must not feed world packets into the two-tab parser:
       // that parser intentionally treats every non-Tab-1 packet as Tab 2.
@@ -5305,11 +5345,56 @@
       if (3 === adu) return;
       PacketParser.getBuffer(alh, adu);
     }
+    static ["handleProto"](alh, adu) {
+      const raw = new Uint8Array(alh.data);
+      if (240 !== raw[0] || 546 !== raw.length || 1 !== raw[1]) {
+        // Legacy server: no opcode remapping. Flush what we queued, then let
+        // this first frame be parsed normally.
+        this._protoWaiting[adu] = false;
+        this._protoSend[adu] = null;
+        this._protoRecv[adu] = null;
+        clearTimeout(this["_protoTimer" + adu]);
+        this.flushProtoQueue(adu);
+        console.log("[proto] Tab " + adu + ": legacy (no opcode map)");
+        return false;
+      }
+      // MapInit: sendMap[r] = raw[18+r]; recvMap[raw[274+r]] = r.
+      const sm = new Uint8Array(256);
+      const rm = new Uint8Array(256);
+      for (let r = 0; r < 256; r++) {
+        sm[r] = raw[18 + r];
+        rm[raw[274 + r]] = r;
+      }
+      this._protoSend[adu] = sm;
+      this._protoRecv[adu] = rm;
+      this._protoWaiting[adu] = false;
+      clearTimeout(this["_protoTimer" + adu]);
+      console.log("[proto] Tab " + adu + ": MapInit applied, opcode remap active");
+      // Ack with the raw 17-byte MapAck (opcode 241 + raw[530..546)) - it is
+      // sent directly, NOT through send(), so the map itself never remaps it.
+      const ack = new Uint8Array(17);
+      ack[0] = 241;
+      ack.set(raw.subarray(530, 546), 1);
+      const ws = 1 === adu ? this.ws : 2 === adu ? this.ws2 : this.ws3;
+      if (ws && ws.readyState === ws.OPEN) {
+        ws.send(ack.buffer);
+      }
+      this.flushProtoQueue(adu);
+      return true;
+    }
+    static ["flushProtoQueue"](adu) {
+      const q = this._protoQueue[adu] || [];
+      this._protoQueue[adu] = [];
+      for (const p of q) {
+        this.send(p, adu);
+      }
+    }
     static ["onClose"](cq, socket) {
       const numericTab = Number(cq);
       const current = numericTab === 1 ? this.ws : numericTab === 2 ? this.ws2 : this.ws3;
       if (current !== socket) return false;
       PacketSender.stopPingLoop(numericTab);
+      clearTimeout(this["_protoTimer" + numericTab]);
       if (this.intentionalDisconnect) return false;
       if (numericTab === 3) {
         this.ws3 = null;
@@ -5578,7 +5663,12 @@
     }
     static ["parse"](amd, ii) {
       const aam = new DataReader(amd);
-      const ahy = aam.readUInt8();
+      let ahy = aam.readUInt8();
+      // 2026 proto-map: incoming opcodes are remapped through the receive
+      // table once the server negotiated a map for this socket.
+      if (WsConnection._protoRecv && WsConnection._protoRecv[ii]) {
+        ahy = WsConnection._protoRecv[ii][ahy];
+      }
       if (16 === ahy) {
         this.worldUpdate(aam, ii);
       } else if (17 === ahy) {
