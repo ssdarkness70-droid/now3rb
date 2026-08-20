@@ -653,6 +653,7 @@
         nick: "profile " + this.selected,
         skin: "https://i.imgur.com/nRqSis7.png",
         skin2: "",
+        nick2: "",
         arbSkin: "",
       };
       if (!abs) {
@@ -660,6 +661,7 @@
       }
       Storage.set("profiles", "profile" + this.selected, abs);
       $("#nick").val(abs.nick);
+      $("#nick2").val(abs.nick2 || "");
       $("#skin").val(abs.skin);
       $("#skin2").val(abs.skin2 || "");
       $("#tag").val(this.tag);
@@ -703,6 +705,9 @@
       $("#nick").blur(() => {
         this.setNick($("#nick").val());
       });
+      $("#nick2").blur(() => {
+        this.setNick2($("#nick2").val());
+      });
       $("#arbSkin").blur(() => {
         this.setarbSkin();
       });
@@ -743,16 +748,19 @@
         nick: "profile " + this.selected,
         skin: "https://i.imgur.com/nRqSis7.png",
         skin2: "",
+        nick2: "",
         arbSkin: "",
       };
       if (!ze) {
         ze = nw;
       }
       $("#nick").val(ze.nick);
+      $("#nick2").val(ze.nick2 || "");
       $("#skin").val(ze.skin);
       $("#skin2").val(ze.skin2 || "");
       $("#arbSkin").val(ze.arbSkin);
       Player.nick = "" === ze.nick ? "An unnamed cell" : ze.nick;
+      Player.nick2 = ze.nick2 || "";
       Player.skin = ze.skin;
       Player.skin2 = ze.skin2 || "";
       Storage.set("profiles", "profile" + this.selected, ze);
@@ -768,6 +776,7 @@
         nick: "profile " + this.selected,
         skin: "https://i.imgur.com/nRqSis7.png",
         skin2: "",
+        nick2: "",
         arbSkin: "",
       };
       if (!ht) {
@@ -776,6 +785,22 @@
       ht.nick = jl;
       Storage.set("profiles", "profile" + this.selected, ht);
       Player.nick = "" === jl ? "An unnamed cell" : jl;
+    }
+    static ["setNick2"](jl) {
+      let ht = Storage.get("profiles", "profile" + this.selected);
+      const o = {
+        nick: "profile " + this.selected,
+        skin: "https://i.imgur.com/nRqSis7.png",
+        skin2: "",
+        nick2: "",
+        arbSkin: "",
+      };
+      if (!ht) {
+        ht = o;
+      }
+      ht.nick2 = jl;
+      Storage.set("profiles", "profile" + this.selected, ht);
+      Player.nick2 = jl;
     }
     static ["setarbSkin"]() {
       var uu = $("#arbSkin").val();
@@ -788,6 +813,7 @@
           arbSkin: uu,
           skin: Renderer.code2Url(Renderer.getImgurCode(yg)),
           arbSkin: uu,
+          nick2: "",
         };
         Player.skin = Renderer.code2Url(Renderer.getImgurCode(yg));
         Storage.set("profiles", "profile" + this.selected, agj);
@@ -801,6 +827,7 @@
         nick: "profile " + this.selected,
         skin: "https://i.imgur.com/nRqSis7.png",
         skin2: "",
+        nick2: "",
         arbSkin: "",
       };
       if (!jg) {
@@ -3625,6 +3652,7 @@
         y: 0x64,
       };
       this._nick = $("#nick").val();
+      this._nick2 = $("#nick2").val();
       this._arbSkin = $("#arbSkin").val();
       this._skin = Renderer.getImgurCode($("#skin").val());
       this._skin2 = Renderer.getImgurCode($("#skin2").val());
@@ -3853,6 +3881,13 @@
     static get ["nick"]() {
       return this._nick.substring(0, 15);
     }
+    static set ["nick2"](va) {
+      this._nick2 = va;
+      RelaySender.nick();
+    }
+    static get ["nick2"]() {
+      return this._nick2 ? this._nick2.substring(0, 15) : "";
+    }
     static set ["arbSkin"](aek) {
       this._arbSkin = aek;
     }
@@ -3927,7 +3962,8 @@
       return ":party" === MainMenu.gMode ? ju + this.colorHex : ju;
     }
     static get ["worldID2"]() {
-      let agw = this._nick.substring(this._nick.indexOf("}") + 1);
+      let agw = (this._nick2 || this._nick);
+      agw = agw.substring(agw.indexOf("}") + 1);
       agw = agw.replace("%*^", "");
       return ":party" === MainMenu.gMode ? agw + this.colorHex2 : agw;
     }
@@ -3959,6 +3995,7 @@
       this.isAlive = 0;
       this.mass = 0;
       this.nick = "";
+      this.nick2 = "";
       this.skin = "";
       this.skin2 = "";
       this.skin2Color = "";
@@ -6102,10 +6139,11 @@
       const n = bTab || Player.typeID;
       if (this.chekConnection(n) && ((1 === n && !Player._isAlive) || (2 === n && !Player._isAlive2))) {
         Camera.isSpectating = false;
-        if ("" === Player.nick) {
-          Player.nick = "An unnamed cell";
+        let xnick = 2 === n && Player.nick2 ? Player.nick2 : Player.nick;
+        if ("" === xnick) {
+          xnick = "An unnamed cell";
         }
-        let xt = unescape(encodeURIComponent(Player.nick));
+        let xt = unescape(encodeURIComponent(xnick));
         let h = unescape(encodeURIComponent("free/" + TeamList.arbSkin));
         const ul = {
           n: xt,
@@ -6755,7 +6793,9 @@
         const abw = ri.readUInt8();
         if (1 & abw) {
           const vf = ri.readStringZeroUtf8();
-          afb.nick = vf;
+          const vg = vf.split("|");
+          afb.nick = vg[0] || "";
+          afb.nick2 = vg[1] || "";
         }
         if (2 & abw) {
           const aey = ri.readUInt8();
@@ -6800,7 +6840,9 @@
       for (let xg = vy.readUInt8(); xg--; ) {
         const ada = vy.readUInt32();
         const ami = RelayData.newPlayer(ada);
-        ami.nick = vy.readStringZeroUtf8();
+        const avn = vy.readStringZeroUtf8().split("|");
+        ami.nick = avn[0] || "";
+        ami.nick2 = avn[1] || "";
         const rk = vy.readUInt8();
         const kz = vy.readUInt8();
         const jh = vy.readUInt8();
@@ -6857,7 +6899,7 @@
     }
     static ["nick"]() {
       if (RelayWs.connected) {
-        const id = unescape(encodeURIComponent(Player.nick));
+        const id = unescape(encodeURIComponent([Player.nick, Player.nick2].join("|")));
         let aes = id.length;
         const vo = this.createView(2 + id.length);
         for (vo.setUint8(0, 1, true); aes--; ) {
@@ -7360,7 +7402,7 @@
         ? "./res/skins/free/" + this.arbSkin.replace(/free\/|.png/g, "") + ".png"
         : "";
       const k1 = this.skinKey(Player.nick, Player.colorHex);
-      const k2 = this.skinKey(Player.nick, Player.colorHex2);
+      const k2 = this.skinKey(Player.nick2 || Player.nick, Player.colorHex2);
       if (u1) {
         this.skinMap.set(k1, u1);
       } else if (arb) {
@@ -7383,7 +7425,7 @@
             const t2 =
               agl.skin2 && !agl.skin2.includes("XXXXXXX") ? this.code2Url(agl.skin2) : t1;
             if (t2) {
-              this.skinMap.set(this.skinKey(agl.nick, agl.skin2Color), t2);
+              this.skinMap.set(this.skinKey(agl.nick2 || agl.nick, agl.skin2Color), t2);
             }
           }
           if (t1) {
@@ -7393,6 +7435,7 @@
     }
     static ["skinKey"](nick, colorHex) {
       let base = nick.substring(nick.indexOf("}") + 1);
+      base = base.replace(/^\[[^\]]*\]\s*/, "");
       base = base.replace("%*^", "");
       return base + colorHex;
     }
