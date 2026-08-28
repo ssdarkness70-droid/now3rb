@@ -5508,6 +5508,9 @@
       this.bindSocket(promoted, tab);
       PacketSender.initPingLoop(tab);
       Player.typeID = tab;
+      if (tab === 1 && Account.loggedIn) {
+        PacketSender.handshake1(1);
+      }
       Notifications.alert("Drag+", "Standby Tab 3 promoted into Tab " + tab + ": " + reason);
       const spawn = () => PacketSender.spawnTab(tab);
       setTimeout(spawn, 100);
