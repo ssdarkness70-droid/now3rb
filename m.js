@@ -5599,21 +5599,20 @@
       if (!hud && document.body) {
         hud = document.createElement("div");
         hud.id = "drag-plus-connection-status";
-        hud.style.cssText = "position:fixed;right:10px;top:205px;z-index:2147483000;min-width:310px;max-width:calc(100vw - 20px);box-sizing:border-box;color:#f1f1f1;background:rgba(5,5,9,.9);border:1px solid rgba(255,255,255,.22);border-radius:6px;padding:6px 8px;font:11px/1.3 Arial,sans-serif;pointer-events:auto;white-space:normal;text-align:right;text-shadow:0 1px 2px #000;box-shadow:0 4px 16px rgba(0,0,0,.28)";
+        hud.style.cssText = "position:fixed;right:5px;z-index:2147483000;text-align:center;font-family:ubuntu,sans-serif;font-size:15px;color:rgba(255,255,255,.75);pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px #000;padding-bottom:3px";
         hud.title = "Standby Tab 3 hot backup: K or /kill manually promotes it.";
-        hud.innerHTML = '<div data-dragplus-role="status" style="white-space:nowrap"></div>';
-        const stopHudEvent = event => event.stopPropagation();
-        for (const eventName of ["pointerdown", "mousedown", "mouseup", "touchstart", "touchend", "keydown", "keyup"]) {
-          hud.addEventListener(eventName, stopHudEvent);
-        }
         document.body.appendChild(hud);
       }
       if (hud) {
-        hud.style.top = "205px";
-        const line = hud.querySelector('[data-dragplus-role="status"]');
-        if (line) {
-          line.textContent = "Drag+ Backup | Tab 1: " + status.tab1 + " | Tab 2: " + status.tab2 + " | Standby 3: " + status.tab3;
+        const restartEl = document.getElementById("server-restart-countdown");
+        if (restartEl) {
+          const restartBottom = parseInt(window.getComputedStyle(restartEl).bottom) || 235;
+          hud.style.bottom = (restartBottom + 20) + "px";
+        } else {
+          hud.style.bottom = "255px";
         }
+        hud.style.width = (Minimap.size || 200) + "px";
+        hud.textContent = "Tab1:" + status.tab1 + " | Tab2:" + status.tab2 + " | Tab3:" + status.tab3;
       }
       return status;
     }
