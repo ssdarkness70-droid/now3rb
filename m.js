@@ -5599,7 +5599,7 @@
       if (!hud && document.body) {
         hud = document.createElement("div");
         hud.id = "drag-plus-connection-status";
-        hud.style.cssText = "position:fixed;right:5px;z-index:2147483000;text-align:center;font-family:ubuntu,sans-serif;font-size:15px;color:rgba(255,255,255,.75);pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px #000;padding-bottom:3px";
+        hud.style.cssText = "position:fixed;right:5px;z-index:2147483000;text-align:center;font-family:ubuntu,sans-serif;font-size:11px;color:rgba(255,255,255,.75);pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px #000;padding-bottom:3px";
         hud.title = "Standby Tab 3 hot backup: K or /kill manually promotes it.";
         document.body.appendChild(hud);
       }
