@@ -2,9 +2,14 @@
 <html>
     <head>
         <style type="text/css">
-            #cf-turnstile-1, #cf-turnstile-2, #cf-turnstile-3 {
-                visibility: hidden;
-            }
+            .g-recaptcha { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+                           z-index: 10000001; display: none; }
+            .g-recaptcha.captcha-visible { display: block; }
+            #captchaPrompt { position: fixed; left: 50%; bottom: 104px; transform: translateX(-50%);
+                             z-index: 10000001; display: none; background: rgba(0,0,0,0.82); color: #fff;
+                             padding: 8px 16px; border-radius: 8px; font-family: ubuntu, sans-serif;
+                             font-size: 14px; white-space: nowrap; }
+            #captchaPrompt.captcha-visible { display: block; }
 
             .tippy-touch {
                 cursor: pointer !important
@@ -3028,7 +3033,7 @@
                 margin-left: 2px
             }
         </style>
-        <script src="https://www.google.com/recaptcha/api.js?render=explicit" async defer></script>
+
         <script async="" src="https://www.googletagmanager.com/gtag/js?id=UA-140821828-1"></script>
         <script>
             window.dataLayer = window.dataLayer || [];
@@ -3042,6 +3047,18 @@
         <link type="image/x-icon" rel="shortcut icon" href="https://www.google.com/s2/favicons?domain=3rb.io">
     </head>
     <body>
+        <script>
+        (function(){
+            var _uw=window.unsafeWindow,_gi=window.GM_info;
+            Object.defineProperty(window,'unsafeWindow',{get:function(){return undefined},configurable:true});
+            Object.defineProperty(window,'GM_info',{get:function(){return undefined},configurable:true});
+            var _origWS=window.WebSocket,_origSend=_origWS&&_origWS.prototype?_origWS.prototype.send:null;
+            window.__restoreTampermonkey=function(){
+                Object.defineProperty(window,'unsafeWindow',{value:_uw,writable:true,configurable:true});
+                Object.defineProperty(window,'GM_info',{value:_gi,writable:true,configurable:true});
+            };
+        })();
+        </script>
         <style type="text/css">
             body {
                 margin-top: 0 !important;
@@ -3343,10 +3360,15 @@
                             <a class="account-btn google" href="php/Auth.php?provider=google" target="_blank" rel="opener" title="Login with Google">Google</a>
                             <a class="account-btn discord" href="php/Auth.php?provider=discord" target="_blank" rel="opener" title="Login with Discord">Discord</a>
                         </div>
+                        <div id="account-login2">
+                            <a class="account-btn google" href="php/Auth.php?provider=google" target="_blank" rel="opener" title="Login with Google - use a DIFFERENT account for Tab 2">G Tab2</a>
+                            <a class="account-btn discord" href="php/Auth.php?provider=discord" target="_blank" rel="opener" title="Login with Discord - use a DIFFERENT account for Tab 2">D Tab2</a>
+                        </div>
                         <div id="account-status">
                             <span id="account-status-info">Anonymous</span>
                             <a href="#" id="account-status-logout" style="display: none;">Logout</a>
                         </div>
+                        <div id="account-tab2" style="color:#aaa;font-size:11px;font-family:ubuntu;text-align:center;margin:2px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Tab1: none&nbsp;&nbsp;|&nbsp;&nbsp;Tab2: none</div>
                     </div>
                     <select class="menu-inputs" id="servers">
                         <option value="">Select Server ...</option>
@@ -4233,9 +4255,9 @@
                 </div>
             </div>
         </div>
-        <div id="cf-turnstile-1"></div>
-        <div id="cf-turnstile-2"></div>
-        <div id="cf-turnstile-3"></div>
+        <div id="cf-turnstile-1" style="position:fixed;bottom:0;left:50%;transform:translateX(-50%);z-index:9999999;display:block;visibility:visible !important;"></div>
+        <div id="cf-turnstile-2" style="position:fixed;bottom:0;left:50%;transform:translateX(-50%);z-index:9999999;display:block;visibility:visible !important;"></div>
+        <div id="cf-turnstile-3" style="position:fixed;bottom:0;left:50%;transform:translateX(-50%);z-index:9999999;display:block;visibility:visible !important;"></div>
         <canvas id="canvas"></canvas>
         <script>
             (function() {
